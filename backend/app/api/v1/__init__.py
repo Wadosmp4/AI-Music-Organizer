@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from app.api.v1.ingestion import router as ingestion_router
 from app.api.v1.onboarding import router as onboarding_router
 from app.api.v1.playlists import router as playlists_router
 from app.api.v1.review_queue import router as review_queue_router
@@ -9,6 +10,7 @@ router = APIRouter(prefix=get_settings().api_v1_prefix)
 router.include_router(review_queue_router)
 router.include_router(playlists_router)
 router.include_router(onboarding_router)
+router.include_router(ingestion_router)
 
 
 @router.get("/health")

@@ -19,3 +19,10 @@ class User(TimestampMixin, table=True):
     onboarding_completed_at: Optional[datetime] = Field(
         default=None, sa_type=DateTime(timezone=True)
     )
+    # Set once the bounded backlog backfill (U4, KTD21) has processed every
+    # already-liked song at least once. Steady-state on-demand checks stay
+    # suspended (only bounded-batch backfill runs) until this is set, so the
+    # two passes never race the same backlog songs.
+    backfill_completed_at: Optional[datetime] = Field(
+        default=None, sa_type=DateTime(timezone=True)
+    )

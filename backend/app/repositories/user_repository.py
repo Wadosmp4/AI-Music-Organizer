@@ -26,3 +26,11 @@ class UserRepository:
         self.session.commit()
         self.session.refresh(user)
         return user
+
+    def mark_backfill_completed(self, user_id: int) -> User:
+        user = self.get(user_id)
+        user.backfill_completed_at = datetime.now(timezone.utc)
+        self.session.add(user)
+        self.session.commit()
+        self.session.refresh(user)
+        return user

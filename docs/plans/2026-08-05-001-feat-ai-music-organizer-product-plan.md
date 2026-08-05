@@ -84,7 +84,7 @@ This plan owns the core organizing product together with its enhancement layer, 
 - R7. The engine analyzes the whole library and proposes playlists the user doesn't have yet, based on clusters of unplaced or thematically related songs.
 - R8. Every suggestion — an addition to an existing playlist, or inclusion in a new one — carries a confidence score.
 - R9. A playlist may carry an explicit rule (e.g. a BPM range and a genre match); when a rule exists, only rule-matching songs are suggested for it. When no rule exists, natural-language description plus AI judgment decides.
-- R10. Every newly liked song is analyzed automatically and enters the review queue; this is continuous, not a manually triggered batch process.
+- R10. Every newly liked song is analyzed on demand and enters the review queue (session-settled: user-directed — an on-demand "check for new songs" trigger, not a background-scheduled process, keeps the backend a plain request/response service with no scheduler/process-singleton concerns; the user or a future automated hook decides when a check runs). This replaces the existing script's full-library-recompute with an incremental diff against already-seen songs, still not a manually-edited JSON batch process.
 
 **Review & Trust**
 
@@ -109,10 +109,10 @@ This plan owns the core organizing product together with its enhancement layer, 
 
 ### Key Flows
 
-- F1. **Continuous new-like organization**
-  - **Trigger:** The user likes a new song on YouTube Music.
+- F1. **On-demand new-like organization**
+  - **Trigger:** The user (or a future automated hook) requests an ingestion check — no background scheduler runs this on its own (session-settled: user-directed, see R10).
   - **Actors:** A1, A2, A3
-  - **Steps:** The engine detects the new like, checks it isn't already placed anywhere, classifies it against existing playlists and any explicit rules, and adds it to the review queue with a confidence score and explanation.
+  - **Steps:** The engine fetches current liked songs, diffs them against the incremental membership index (KTD7) to find any not yet seen, checks each isn't already placed anywhere, classifies it against existing playlists and any explicit rules, and adds it to the review queue with a confidence score and explanation.
   - **Covers:** R3, R4, R5, R8, R9, R10, R14
 - F2. **Natural-language custom playlist creation**
   - **Trigger:** The user describes a playlist in natural language.
@@ -192,8 +192,8 @@ This plan owns the core organizing product together with its enhancement layer, 
 **Ingestion & Auth**
 
 - KTD4. **Server-side web OAuth for the official Data API, plus a manual reconnect page for the cookie auth** (session-settled: user-directed — chosen over keeping both mechanisms CLI-only, or fixing only the OAuth detection path: a persistent backend and a remote mobile client can't rely on a local-server browser popup, and "stays organized automatically" requires an in-app reconnect path rather than a CLI chore).
-- KTD5. **APScheduler + `SQLAlchemyJobStore` in a single dedicated process** for continuous ingestion — persists schedule state across restarts; defers Celery/ARQ until real concurrent multi-user ingestion load exists. Governs R10.
-- KTD6. **System-level ingestion/auth health status**, distinct from per-playlist health (R18) — surfaces "ingestion paused since X — reconnect" instead of silent failure; approved-but-unapplied queue items are held, not lost, until write-auth is restored. Governs R10.
+- KTD5. **On-demand ingestion endpoint, no background scheduler** (session-settled: user-directed — chosen over APScheduler + a dedicated process: this keeps the backend a plain stateless request/response service with no process-singleton or missed-tick-on-restart concerns; revisit if a future need for automatic detection between visits outweighs that simplicity). Governs R10.
+- KTD6. **System-level ingestion/auth health status**, distinct from per-playlist health (R18) — surfaces "ingestion degraded since X — reconnect" instead of silent failure on the next on-demand check; approved-but-unapplied queue items are held, not lost, until write-auth is restored. Governs R10.
 - KTD7. **Incremental membership index for "already placed" tracking** — replaces the existing script's full-library recompute-per-run with a persisted high-water-mark, so continuous per-like ingestion doesn't rescan the whole library on every event. Governs R10.
 - KTD17. **Ingestion/detection health (OAuth) and write health (cookie auth) are two independently surfaced states, never blended into one signal** — a stalled detection path and a degraded write path need distinguishable reconnect actions, and hard OAuth-token revocation (not just expiry) gets its own manual-reconnect affordance rather than relying solely on refresh. Extends KTD6. Governs R10.
 - KTD18. **Per-dependency timeout and circuit-breaking in the classification hot path** (LLM, Last.fm, GetSongBPM) — a slow or failing external call fails only that song's classification for the current tick, never blocks detection of every other new like. A rate-limited or degraded response (not just a clean miss) is surfaced through KTD17's health status, not silently treated as "not found." Governs R10.
@@ -218,7 +218,7 @@ This plan owns the core organizing product together with its enhancement layer, 
 
 **Deployment**
 
-- KTD22. **The APScheduler ingestion job's single-process constraint is a deployment topology requirement, not an assumption** — enforced via a pinned replica count and a startup check that reports scheduler-instance identity, so an accidental second instance fails loudly instead of double-firing the job silently. A DB row-level advisory lock is the stated escalation path if ingestion ever needs to scale horizontally, but is not built in Phase 1 — YAGNI until real horizontal-scaling need appears. Extends KTD5.
+- KTD22. **Superseded by KTD5's on-demand-ingestion revision** — with no background scheduler, there is no dedicated ingestion process whose single-instance-ness needs enforcing. Concurrent on-demand checks racing each other are bounded by the same compare-and-swap invariant (KTD19) every other writer to `review_queue` already follows, not a separate deployment-topology guard. `backend`'s replica count still stays pinned at 1 in compose (KTD26), but that's now about the whole stateless service, not a scheduler singleton.
 - KTD26. **Docker Compose is the Phase 1 run topology for every service — backend and web alike** (session-settled: user-directed) — each gets its own Dockerfile, orchestrated by one root `docker-compose.yml` with a named volume for the SQLite data file so it persists across container restarts; `backend`'s replica count stays pinned at 1 in compose to hold KTD22's single-process ingestion constraint. This is the one way to run the stack in Phase 1 — no bare-metal `uvicorn`/`vite` run path is separately maintained. Governs R19, R20, R22.
 
 **Code Organization & Principles**
@@ -240,12 +240,10 @@ flowchart TB
   LLM["LLM classification\n(litellm / OpenRouter)"]
   BPM["GetSongBPM"]
   LFM["Last.fm genre tags"]
-  SCHED["APScheduler\n(ingestion job)"]
   WEB["React web app"]
   MOB["Mobile app\n(Phase 3, React Native)"]
 
-  SCHED --> YTD
-  SCHED --> BE
+  BE --> YTD
   BE --> YTM
   BE --> DB
   BE --> LLM
@@ -259,12 +257,12 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  A["Scheduler tick"] --> B["Fetch Liked Songs\nvia Data API (U2)"]
+  A["POST /ingestion/check\n(on demand, KTD5)"] --> B["Fetch Liked Songs\nvia Data API (U2)"]
   B --> C{"In membership\nindex? (KTD7)"}
   C -->|yes| D["Skip"]
   C -->|no| E["Classify one song\n(U3: rules, LLM, BPM, genre;\nper-dependency timeout, KTD18)"]
   E -->|ok or degraded fallback| F["Write review_queue item\n(confidence + explanation)"]
-  E -->|dependency times out| H["Skip this song only;\nnext tick retries it (KTD18)"]
+  E -->|dependency times out| H["Skip this song only;\nnext check call retries it (KTD18)"]
   F --> G["Update ingestion health (KTD17)"]
 ```
 
@@ -300,6 +298,7 @@ backend/
       review_queue.py
       playlists.py
       onboarding.py
+      ingestion.py
       auth_status.py
     integrations/
       base.py
@@ -320,7 +319,6 @@ backend/
       correction_log_repository.py
       library_repository.py
     jobs/
-      scheduler.py
       ingestion.py
     models/
   alembic/
@@ -342,13 +340,13 @@ web/
 - **Two independent auth failure domains must never blend into one signal.** The write path (cookie auth) and the detection path (OAuth) fail independently; a blended health status would point the user at the wrong reconnect flow, or hide a stalled detection path behind an idle-looking queue. KTD17 makes both states explicit and independently surfaced; U2 and U8 implement this.
 - **A single slow or failing classification dependency must not stall detection of every other new like.** The continuous ingestion job (U4) runs in one dedicated process (KTD5); without per-dependency isolation, one hung call to the LLM, Last.fm, or GetSongBPM would block the whole tick. KTD18 scopes failure to the one song being classified.
 - **The review queue's "backend decides / user decides" seam must never leave an item in an ambiguous state.** Approval and move both perform an external write; on failure, the item must return to `pending` rather than being silently left as if applied. The lifecycle diagram above adds a `write_pending` state (KTD17) and KTD19's compare-and-swap invariant to close this gap.
-- **The credential and scheduler layers are single-tenant today even though the data model is not.** KTD2's per-`user_id` schema isolates data cleanly, but U2's auth wrappers and U4's scheduler both assume one YouTube account and one ingestion cadence. Adding a second real user would need per-user credential storage and per-user scheduling before the schema's isolation is actually usable — this plan does not build that, but a future multi-user pass should target the credential/scheduler layer, not re-litigate KTD2's schema.
+- **The credential layer is single-tenant today even though the data model is not.** KTD2's per-`user_id` schema isolates data cleanly, but U2's auth wrappers assume one YouTube account. Adding a second real user would need per-user credential storage before the schema's isolation is actually usable — this plan does not build that, but a future multi-user pass should target the credential layer, not re-litigate KTD2's schema.
 
 ### Risks & Dependencies
 
 - **SQLite's permissiveness can mask bugs that only surface at the Postgres cutover.** SQLite doesn't enforce foreign keys by default and has no real column type enforcement; U1 requires enabling foreign-key enforcement and DB-level status constraints now so the eventual Postgres migration (KTD2) doesn't surface latent integrity bugs for the first time in production.
 - **`correction_log`'s append-only guarantee is currently a convention, not an enforced constraint.** Since U7's feedback loop treats it as ground truth, an unenforced accidental update or delete would silently corrupt future classification. KTD20 requires DB-level enforcement, not just ORM discipline.
-- **Running the ingestion scheduler under multiple worker processes would silently double-fire every job.** This is a known class of APScheduler pitfall, not a hypothetical: KTD22 requires the single-process constraint to be a deployment-topology guarantee (pinned replica count, a startup identity check) rather than an assumption that could quietly break under a future deployment change.
+- **Superseded by KTD5's on-demand-ingestion revision.** With no background scheduler, the multi-worker-double-fire risk this bullet named no longer applies; concurrent on-demand `/ingestion/check` calls are bounded by KTD19's compare-and-swap invariant instead (see KTD22).
 - **The existing 1,350-song backlog is a burst risk against GetSongBPM's rate limit, not just steady-state traffic.** Steady-state per-like ingestion is low-volume and not a bottleneck at this project's scale (R22). The risk is the first-run backfill of the existing backlog, which KTD21 requires to run as its own rate-limited pass rather than bursting through the classification path all at once.
 
 ---
@@ -413,24 +411,24 @@ web/
   - A single song's classification timeout does not block the calling ingestion tick from processing the next song.
 - **Verification:** `pytest` passes; a golden-set of the existing script's known-good clusters (e.g. the Aurora and Attack on Titan cases verified earlier this session) still classify correctly.
 
-### U4. Continuous ingestion job
+### U4. On-demand ingestion check
 
-- **Goal:** Replace the script's full-library-recompute with a scheduled, incremental ingestion pipeline, plus a bounded backfill for the existing backlog. **Realizes F1.**
+- **Goal:** Replace the script's full-library-recompute with an on-demand, incremental ingestion endpoint, plus a bounded backfill for the existing backlog. **Realizes F1.**
 - **Requirements:** R10, R22
 - **Dependencies:** U1, U2, U3, U9
-- **Files:** `backend/app/jobs/ingestion.py`, `backend/app/jobs/scheduler.py`
+- **Files:** `backend/app/api/v1/ingestion.py`, `backend/app/jobs/ingestion.py`
 - **Approach:**
-  - Poll U2's Data API client on a schedule, running in a single dedicated process with a startup identity check that fails loudly if a second scheduler instance is detected (KTD22).
-  - Diff against U1's incremental membership index (KTD7) instead of recomputing the full library; classify new songs via U3; write `review_queue` rows through the repository layer (KTD23) via a compare-and-swap on `(id, version)` (KTD19); surface ingestion health via KTD17.
-  - Process the existing, already-liked backlog as a separate rate-limited backfill pass, distinct from steady-state per-like ticks, respecting GetSongBPM's 3,000 req/hour ceiling (KTD21). This backfill pass does not start until U9's onboarding playlist selection has completed, since it classifies against the playlist set U9 finalizes; steady-state per-like ticks are suspended until the first backfill pass finishes, so the two never race the same backlog songs.
-- **Execution note:** Add characterization coverage for the incremental-diff logic before wiring the scheduler — this is the piece with no precedent in the existing script.
+  - No background scheduler (KTD5, session-settled: user-directed) — a `POST /api/v1/ingestion/check` endpoint runs one ingestion pass on request, callable by the user or a future automated hook without any process-singleton concern (KTD22 is superseded: concurrent on-demand calls are bounded by the same CAS invariant, KTD19, as every other `review_queue` writer).
+  - Diff against U1's incremental membership index (KTD7) instead of recomputing the full library; classify new songs via U3; write `review_queue` rows through the repository layer (KTD23); surface ingestion health via KTD17.
+  - The existing, already-liked backlog is processed as a bounded-batch-per-call backfill, distinct from a steady-state check (which typically has 0-1 new songs), respecting GetSongBPM's 3,000 req/hour ceiling (KTD21) by capping songs classified per call rather than bursting the whole backlog in one request. This backfill does not start until U9's onboarding playlist selection has completed, since it classifies against the playlist set U9 finalizes; steady-state checks are suspended until the first backfill pass finishes, so the two never race the same backlog songs. A caller repeats the check call until the backfill reports itself complete.
+- **Execution note:** Add characterization coverage for the incremental-diff logic before wiring the endpoint — this is the piece with no precedent in the existing script.
 - **Test scenarios:**
   - A new liked song not yet in the membership index produces exactly one queue item.
   - An already-placed song produces none.
-  - A scheduler restart resumes without reprocessing already-seen songs.
-  - The backfill pass processes the existing backlog without exceeding GetSongBPM's rate limit, and resumes correctly if interrupted partway through.
-  - An ingestion-job write (staleness marking, KTD14) racing a concurrent user action on the same queue row results in a version conflict, never a silent overwrite (KTD19).
-- **Verification:** `pytest` passes against a mocked scheduler tick; one manual live run against the real account, including the first-run backfill.
+  - Calling the check again resumes without reprocessing already-seen songs.
+  - The backfill pass processes the existing backlog in bounded batches without exceeding GetSongBPM's rate limit, and resumes correctly across repeated calls.
+  - An ingestion-check write (staleness marking, KTD14) racing a concurrent user action on the same queue row results in a version conflict, never a silent overwrite (KTD19).
+- **Verification:** `pytest` passes against a mocked ingestion check; one manual live run against the real account, including the first-run backfill.
 
 ### U5. Review queue API
 
@@ -440,7 +438,7 @@ web/
 - **Files:** `backend/app/api/v1/review_queue.py`, `backend/app/services/review_queue.py`, `backend/tests/test_review_queue_api.py`
 - **Approach:**
   - List/approve/reject/move endpoints; approve and move both transition an item to a held `write_pending` state before calling U2's write path for exactly one item (never a full-file replay); on write failure the item returns to `pending` and KTD17's health status is raised, rather than the item being left stuck as if applied.
-  - Re-validate source liveness synchronously at approve/move time (not solely relying on the next ingestion tick's staleness pass, KTD14) so a race between a paused scheduler and a user action can't approve a song that's already gone.
+  - Re-validate source liveness synchronously at approve/move time (not solely relying on the next on-demand ingestion check's staleness pass, KTD14) so a race between a stale (not-recently-checked) library state and a user action can't approve a song that's already gone.
   - The service calls the review-queue and correction-log repositories (KTD23) for every read/write, never the ORM directly. Every reassignment writes a `correction_log` row (KTD8, append-only enforced at the DB layer per KTD20); every write is a compare-and-swap on `(id, version)` per KTD19, covering both user actions and the ingestion job as writers.
   - Merge/duplicate actions from the future enhancement layer are expected to route through this same API (KTD15).
 - **Test scenarios:**
