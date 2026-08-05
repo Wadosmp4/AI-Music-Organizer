@@ -26,3 +26,20 @@ class CorrectionLogRepository:
                 select(CorrectionLogEntry).where(CorrectionLogEntry.user_id == user_id)
             )
         )
+
+    def list_recent_for_user(self, user_id: int, limit: int = 20) -> list[CorrectionLogEntry]:
+        """Bounded recent-N corrections for a user (KTD12), most recent first.
+
+        Deliberately not `list_for_user`'s full history: feedback into future
+        classification is scoped to a fixed recent-N so a single stale
+        correction can't dominate forever, and old corrections naturally age
+        out as new ones are logged.
+        """
+        return list(
+            self.session.exec(
+                select(CorrectionLogEntry)
+                .where(CorrectionLogEntry.user_id == user_id)
+                .order_by(CorrectionLogEntry.id.desc())
+                .limit(limit)
+            )
+        )

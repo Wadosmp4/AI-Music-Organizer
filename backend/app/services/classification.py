@@ -6,6 +6,13 @@ artist-similarity against existing playlist contents (ported from
 organize_music.py's build_plan) is tried first, then an LLM description
 match. A per-song failure in any external call (KTD18) degrades gracefully
 to the next signal rather than raising and blocking the caller's next song.
+
+Correction feedback (U7/R15/KTD12): when a `CorrectionLogRepository` is
+wired in, a bounded recent-N of that user's past corrections for the same
+artist/genre cluster contribute a bonus to the artist-similarity score of
+the playlist the user actually moved the song *to*. This only shifts
+*future* classify_track calls — it never re-evaluates other pending queue
+items, and it never touches a ruled playlist's outcome (KTD10 untouched).
 """
 
 from dataclasses import dataclass
@@ -19,6 +26,7 @@ from app.integrations.base import Track
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.integrations.http_client import CircuitBreaker, call_with_retry
 from app.integrations.ytmusic_client import artist_bucket_key, track_artist
+from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.services.bpm_lookup import BpmLookupService
 from app.services.genre_lookup import GenreLookupService
 
@@ -26,6 +34,16 @@ litellm.suppress_debug_info = True
 
 DESCRIPTION_MATCH_MODEL = "openrouter/google/gemini-2.5-flash"
 MIN_MATCH_SCORE = 2  # ported from organize_music.py
+
+# KTD12: feedback is bounded to a fixed recent-N of corrections, never the
+# user's whole history.
+CORRECTION_LOOKBACK_LIMIT = 20
+# Weight of a single matching recent correction in the artist-similarity
+# score, expressed in the same units as `artist_counts` (existing-song
+# tallies). Set equal to MIN_MATCH_SCORE so one relevant correction alone is
+# enough to surface a destination playlist that otherwise has zero
+# existing-song history with this artist.
+CORRECTION_BONUS_PER_MATCH = MIN_MATCH_SCORE
 
 
 @dataclass
@@ -39,7 +57,7 @@ class CandidatePlaylist:
 
 @dataclass
 class Explanation:
-    signal: str  # "rule" | "artist_similarity" | "description_match" | "none"
+    signal: str  # "rule" | "artist_similarity" | "correction_feedback" | "description_match" | "none"
     detail: str
 
 
@@ -68,20 +86,40 @@ def _rule_matches(rule: dict, genre: Optional[str], bpm: Optional[float]) -> boo
     return True
 
 
+def build_correction_context(track: Track, genre: Optional[str]) -> dict:
+    """Context payload for a `CorrectionLogEntry` logged at review-time.
+
+    Populates the fields `_correction_boosts` matches future classify_track
+    calls on: the artist bucket key (same normalization used for
+    artist-similarity, so channel-name variants of one artist still collide)
+    and the genre at the time of the correction. Callers that log
+    corrections (e.g. a review-queue move) may merge additional keys in.
+    """
+    return {"artist_bucket_key": artist_bucket_key(track), "artist": track_artist(track), "genre": genre}
+
+
 class ClassificationService:
     def __init__(
         self,
         genre_lookup: GenreLookupService,
         bpm_lookup: BpmLookupService,
         openrouter_api_key: Optional[str] = None,
+        correction_log_repo: Optional[CorrectionLogRepository] = None,
     ):
         self.genre_lookup = genre_lookup
         self.bpm_lookup = bpm_lookup
         self.openrouter_api_key = openrouter_api_key or bpm_lookup.openrouter_api_key
+        # U7/R15: additive and optional. When None (the default — unchanged for
+        # every existing two-positional-arg caller), classify_track's behavior
+        # is byte-for-byte identical to before this parameter existed.
+        self.correction_log_repo = correction_log_repo
         self._circuit_breaker = CircuitBreaker()
 
     def classify_track(
-        self, track: Track, candidate_playlists: list[CandidatePlaylist]
+        self,
+        track: Track,
+        candidate_playlists: list[CandidatePlaylist],
+        user_id: Optional[int] = None,
     ) -> ClassificationResult:
         artist = track_artist(track)
         genre = self.genre_lookup.genre_for(artist)
@@ -105,19 +143,36 @@ class ClassificationService:
         unruled_playlists = [p for p in candidate_playlists if not p.rule]
 
         key = artist_bucket_key(track)
-        best_playlist, best_score = None, 0
+        # U7/R15: when unset (the default), this is `{}` and every line below
+        # behaves exactly as it did before this parameter existed — `score`
+        # equals `base_score` for every playlist, so `best_signal` is always
+        # "artist_similarity", unchanged from before.
+        correction_boosts = self._correction_boosts(user_id, key, genre)
+        best_playlist, best_score, best_base_score = None, 0, 0
         for playlist in unruled_playlists:
-            score = playlist.artist_counts.get(key, 0)
+            base_score = playlist.artist_counts.get(key, 0)
+            score = base_score + correction_boosts.get(playlist.id, 0)
             if score > best_score:
-                best_playlist, best_score = playlist, score
+                best_playlist, best_score, best_base_score = playlist, score, base_score
         if best_playlist and best_score >= MIN_MATCH_SCORE:
+            if best_base_score >= MIN_MATCH_SCORE:
+                # Existing-song history alone already clears the bar —
+                # identical to pre-U7 behavior, correction feedback or not.
+                signal = "artist_similarity"
+                detail = f"{best_base_score} existing songs by this artist already in '{best_playlist.name}'"
+            else:
+                # A recent correction (KTD12: bounded recent-N, same
+                # artist/genre cluster) is what tipped this playlist over the
+                # threshold — name it as its own signal rather than
+                # overstating existing-song history that isn't there.
+                signal = "correction_feedback"
+                detail = (
+                    f"a recent correction for this artist/genre moved a similar song to '{best_playlist.name}'"
+                )
             return ClassificationResult(
                 playlist_id=best_playlist.id,
                 confidence=min(0.5 + 0.1 * best_score, 0.95),
-                explanation=Explanation(
-                    "artist_similarity",
-                    f"{best_score} existing songs by this artist already in '{best_playlist.name}'",
-                ),
+                explanation=Explanation(signal, detail),
                 bpm=bpm_result.bpm,
                 bpm_source=bpm_result.source,
                 genre=genre,
@@ -145,6 +200,48 @@ class ClassificationService:
             bpm_source=bpm_result.source,
             genre=genre,
         )
+
+    def _correction_boosts(
+        self, user_id: Optional[int], key: str, genre: Optional[str]
+    ) -> dict[int, int]:
+        """Additive artist-similarity bonus per destination playlist id (U7/R15).
+
+        Reads a bounded recent-N (KTD12) of this user's past corrections and
+        tallies, per `corrected_playlist_id` (the playlist the user actually
+        moved the song *to*), how many of those recent corrections were for
+        the same artist bucket or the same genre as the song being classified
+        right now. Read-only: this never mutates a `ReviewQueueItem` or any
+        other row, and never re-evaluates other pending queue items — it only
+        shapes the score computed for *this* classify_track call.
+
+        Returns `{}` when no repo is wired in, when no user_id was given, or
+        when no recent correction matches — in every one of those cases the
+        caller's scoring loop behaves exactly as it did before this method
+        existed.
+        """
+        if self.correction_log_repo is None or user_id is None:
+            return {}
+
+        corrections = self.correction_log_repo.list_recent_for_user(
+            user_id, limit=CORRECTION_LOOKBACK_LIMIT
+        )
+        boosts: dict[int, int] = {}
+        for entry in corrections:
+            if entry.corrected_playlist_id is None:
+                continue
+            context = entry.context or {}
+            same_artist = context.get("artist_bucket_key") == key
+            entry_genre = context.get("genre")
+            same_genre = (
+                genre is not None
+                and entry_genre is not None
+                and str(entry_genre).lower() == genre.lower()
+            )
+            if same_artist or same_genre:
+                boosts[entry.corrected_playlist_id] = (
+                    boosts.get(entry.corrected_playlist_id, 0) + CORRECTION_BONUS_PER_MATCH
+                )
+        return boosts
 
     def _match_description(
         self, track: Track, playlists: list[CandidatePlaylist]
