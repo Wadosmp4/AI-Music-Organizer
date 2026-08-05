@@ -29,16 +29,23 @@ class ReviewQueueRepository:
             )
         )
 
-    def update_status(self, item_id: int, expected_version: int, new_status: str) -> ReviewQueueItem:
-        """Compare-and-swap status update. Raises VersionConflictError on a version mismatch (KTD19)."""
+    def update(self, item_id: int, expected_version: int, **fields) -> ReviewQueueItem:
+        """Compare-and-swap update of arbitrary fields. Raises VersionConflictError
+        on a version mismatch (KTD19) — covers every writer to this row: user
+        actions and the ingestion job's staleness marking alike."""
         item = self.get(item_id)
         if item is None or item.version != expected_version:
             raise VersionConflictError(
                 f"review_queue_item {item_id} version mismatch (expected {expected_version})"
             )
-        item.status = new_status
+        for key, value in fields.items():
+            setattr(item, key, value)
         item.version += 1
         self.session.add(item)
         self.session.commit()
         self.session.refresh(item)
         return item
+
+    def update_status(self, item_id: int, expected_version: int, new_status: str) -> ReviewQueueItem:
+        """Compare-and-swap status update. Raises VersionConflictError on a version mismatch (KTD19)."""
+        return self.update(item_id, expected_version, status=new_status)

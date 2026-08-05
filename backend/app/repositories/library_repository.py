@@ -9,6 +9,9 @@ class LibraryRepository:
     def __init__(self, session: Session):
         self.session = session
 
+    def get(self, item_id: int) -> Optional[LibraryItem]:
+        return self.session.get(LibraryItem, item_id)
+
     def get_by_video_id(self, video_id: str) -> Optional[LibraryItem]:
         return self.session.exec(
             select(LibraryItem).where(LibraryItem.video_id == video_id)

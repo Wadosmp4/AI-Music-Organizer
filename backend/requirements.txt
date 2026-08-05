@@ -9,6 +9,10 @@ python-dotenv==1.0.1
 ytmusicapi==1.10.2
 google-api-python-client==2.157.0
 google-auth-oauthlib==1.2.1
+# Pinned explicitly: cryptography>=44 (a transitive dep of google-auth's
+# crypt backend) ships a Rust extension that SIGILLs on this environment's
+# aarch64 container — 43.0.3 is the newest version confirmed working here.
+cryptography==43.0.3
 
 # Classification (U3)
 litellm==1.55.4
