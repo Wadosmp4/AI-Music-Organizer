@@ -1,0 +1,25 @@
+# Secrets / credentials — never commit
+.env
+browser.json
+oauth.json.broken
+yt_data_token.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Legacy script run artifacts (regenerated locally, not source)
+plan.json
+lastfm_genre_cache.json
+run_output*.log
+oauth_flow.log
+
+# Editors / OS
+.DS_Store
+
+# CE tooling (local skill framework, not project source)
+.claude/

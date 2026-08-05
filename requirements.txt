@@ -1,0 +1,7 @@
+ytmusicapi>=1.7.0
+requests>=2.31.0
+litellm>=1.50.0
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.2.0
