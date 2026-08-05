@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     yt_data_api_redirect_uri: str = "http://localhost:8000/api/v1/auth/youtube/callback"
     yt_data_api_token_file: str = "data/yt_data_token.json"
 
+    # Classification hot-path externals (KTD9, KTD18).
+    lastfm_api_key: str = ""
+    getsongbpm_api_key: str = ""
+    openrouter_api_key: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
