@@ -3,6 +3,7 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from app.models.review_queue import ReviewQueueItem
+from app.repositories.base import save
 
 
 class VersionConflictError(Exception):
@@ -17,10 +18,7 @@ class ReviewQueueRepository:
         return self.session.get(ReviewQueueItem, item_id)
 
     def create(self, item: ReviewQueueItem) -> ReviewQueueItem:
-        self.session.add(item)
-        self.session.commit()
-        self.session.refresh(item)
-        return item
+        return save(self.session, item)
 
     def list_for_user(self, user_id: int) -> list[ReviewQueueItem]:
         return list(
@@ -41,10 +39,7 @@ class ReviewQueueRepository:
         for key, value in fields.items():
             setattr(item, key, value)
         item.version += 1
-        self.session.add(item)
-        self.session.commit()
-        self.session.refresh(item)
-        return item
+        return save(self.session, item)
 
     def update_status(self, item_id: int, expected_version: int, new_status: str) -> ReviewQueueItem:
         """Compare-and-swap status update. Raises VersionConflictError on a version mismatch (KTD19)."""

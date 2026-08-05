@@ -26,6 +26,7 @@ from app.integrations.base import Track
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.integrations.http_client import CircuitBreaker, call_with_retry
 from app.integrations.ytmusic_client import artist_bucket_key, track_artist
+from app.models.playlist import Playlist
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.services.bpm_lookup import BpmLookupService
 from app.services.genre_lookup import GenreLookupService
@@ -54,6 +55,16 @@ class CandidatePlaylist:
     description: Optional[str]
     artist_counts: dict[str, int]  # artist_bucket_key -> count of existing songs by that artist
 
+    @classmethod
+    def from_playlist(cls, playlist: Playlist, artist_counts: Optional[dict[str, int]] = None) -> "CandidatePlaylist":
+        return cls(
+            id=playlist.id,
+            name=playlist.name,
+            rule=playlist.rule,
+            description=playlist.description,
+            artist_counts=artist_counts or {},
+        )
+
 
 @dataclass
 class Explanation:
@@ -69,6 +80,15 @@ class ClassificationResult:
     bpm: Optional[float]
     bpm_source: Optional[str]
     genre: Optional[str]
+
+    def as_explanation_dict(self) -> dict:
+        return {
+            "signal": self.explanation.signal,
+            "detail": self.explanation.detail,
+            "bpm": self.bpm,
+            "bpm_source": self.bpm_source,
+            "genre": self.genre,
+        }
 
 
 class _DescriptionMatch(BaseModel):

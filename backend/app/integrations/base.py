@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from app.models.library import LibraryItem
 
 
 class TrackArtist(TypedDict):
@@ -10,6 +13,10 @@ class Track(TypedDict, total=False):
     videoId: str
     title: str
     artists: list[TrackArtist]
+
+
+def track_from_library_item(item: "LibraryItem") -> Track:
+    return {"videoId": item.video_id, "title": item.title, "artists": [{"name": item.artist}]}
 
 
 class PlaylistSummary(TypedDict):

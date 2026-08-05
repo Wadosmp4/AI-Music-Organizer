@@ -10,6 +10,7 @@ vi.mock("../src/api/client");
 const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
   detection_path: { status: "ok", reason: null },
+  youtube_detection: { status: "ok", reason: null },
   llm: { status: "ok", reason: null },
   lastfm: { status: "ok", reason: null },
   getsongbpm: { status: "ok", reason: null },

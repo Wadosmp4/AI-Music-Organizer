@@ -101,12 +101,8 @@ def run_ingestion_check(
     limit = BACKFILL_BATCH_SIZE if is_backfill else None
     new_songs = all_new_songs[:limit] if limit is not None else all_new_songs
 
-    playlists = playlist_repository.list_for_user(user_id)
     candidates = [
-        CandidatePlaylist(
-            id=p.id, name=p.name, rule=p.rule, description=p.description, artist_counts={}
-        )
-        for p in playlists
+        CandidatePlaylist.from_playlist(p) for p in playlist_repository.list_for_user(user_id)
     ]
 
     queue_items_created = 0
@@ -135,13 +131,7 @@ def run_ingestion_check(
                 library_item_id=library_item.id,
                 playlist_id=result.playlist_id,
                 confidence=result.confidence,
-                explanation={
-                    "signal": result.explanation.signal,
-                    "detail": result.explanation.detail,
-                    "bpm": result.bpm,
-                    "bpm_source": result.bpm_source,
-                    "genre": result.genre,
-                },
+                explanation=result.as_explanation_dict(),
             )
         )
         queue_items_created += 1
@@ -173,15 +163,20 @@ def _mark_removed_songs(
     stale using their version as of `queue_items_snapshot` — never a silent
     overwrite if a concurrent user action already changed that row's version
     in the meantime (KTD19)."""
+    active_queue_items_by_library_item_id: dict[int, list[ReviewQueueItem]] = {}
+    for queue_item in queue_items_snapshot:
+        if queue_item.status in _ACTIVE_QUEUE_STATUSES:
+            active_queue_items_by_library_item_id.setdefault(queue_item.library_item_id, []).append(
+                queue_item
+            )
+
     marked = 0
     for item in existing_items:
         if item.video_id in liked_video_ids or item.removed_at is not None:
             continue
         library_repository.mark_removed(item.id)
         marked += 1
-        for queue_item in queue_items_snapshot:
-            if queue_item.library_item_id != item.id or queue_item.status not in _ACTIVE_QUEUE_STATUSES:
-                continue
+        for queue_item in active_queue_items_by_library_item_id.get(item.id, []):
             try:
                 review_queue_repository.update(queue_item.id, queue_item.version, status="stale")
             except VersionConflictError:

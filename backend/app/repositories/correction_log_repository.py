@@ -1,6 +1,7 @@
 from sqlmodel import Session, select
 
 from app.models.correction_log import CorrectionLogEntry
+from app.repositories.base import save
 
 
 class CorrectionLogRepository:
@@ -15,10 +16,7 @@ class CorrectionLogRepository:
         self.session = session
 
     def create(self, entry: CorrectionLogEntry) -> CorrectionLogEntry:
-        self.session.add(entry)
-        self.session.commit()
-        self.session.refresh(entry)
-        return entry
+        return save(self.session, entry)
 
     def list_for_user(self, user_id: int) -> list[CorrectionLogEntry]:
         return list(

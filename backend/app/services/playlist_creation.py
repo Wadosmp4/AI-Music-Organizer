@@ -11,24 +11,20 @@ without re-deriving the description.
 
 from dataclasses import dataclass
 
-from app.integrations.base import Track
-from app.models.library import LibraryItem
+from app.integrations.base import track_from_library_item
 from app.models.playlist import Playlist
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.services.classification import CandidatePlaylist, ClassificationService
+from app.services.unplaced import unplaced_library_items
 
 
 @dataclass
 class PlaylistCreationResult:
     playlist: Playlist
     review_queue_items_created: int
-
-
-def _track_from_library_item(item: LibraryItem) -> Track:
-    return {"videoId": item.video_id, "title": item.title, "artists": [{"name": item.artist}]}
 
 
 class PlaylistCreationService:
@@ -64,11 +60,17 @@ class PlaylistCreationService:
         description, not just at creation time.
         """
         candidates = self._build_candidates(user_id, playlist)
-        library_items = self.library_repository.list_for_user(user_id)
+        # Only unplaced songs are candidates — a song already approved/moved
+        # elsewhere represents a settled decision and isn't reconsidered just
+        # because a new playlist was created (also avoids reclassifying the
+        # whole library, not just the backlog, on every playlist creation).
+        library_items = unplaced_library_items(
+            user_id, self.library_repository, self.review_queue_repository
+        )
 
         created_count = 0
         for item in library_items:
-            track = _track_from_library_item(item)
+            track = track_from_library_item(item)
             result = self.classification_service.classify_track(track, candidates, user_id=user_id)
             if result.playlist_id != playlist.id:
                 continue
@@ -79,13 +81,7 @@ class PlaylistCreationService:
                     library_item_id=item.id,
                     playlist_id=playlist.id,
                     confidence=result.confidence,
-                    explanation={
-                        "signal": result.explanation.signal,
-                        "detail": result.explanation.detail,
-                        "bpm": result.bpm,
-                        "bpm_source": result.bpm_source,
-                        "genre": result.genre,
-                    },
+                    explanation=result.as_explanation_dict(),
                 )
             )
             created_count += 1
@@ -101,23 +97,9 @@ class PlaylistCreationService:
         either way, so its own artist_counts is always empty.
         """
         candidates = [
-            CandidatePlaylist(
-                id=existing.id,
-                name=existing.name,
-                rule=existing.rule,
-                description=existing.description,
-                artist_counts={},
-            )
+            CandidatePlaylist.from_playlist(existing)
             for existing in self.playlist_repository.list_for_user(user_id)
             if existing.id != playlist.id
         ]
-        candidates.append(
-            CandidatePlaylist(
-                id=playlist.id,
-                name=playlist.name,
-                rule=playlist.rule,
-                description=playlist.description,
-                artist_counts={},
-            )
-        )
+        candidates.append(CandidatePlaylist.from_playlist(playlist))
         return candidates

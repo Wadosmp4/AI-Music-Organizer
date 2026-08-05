@@ -31,6 +31,7 @@ export interface StatusEntry {
 export interface AuthStatus {
   write_path: StatusEntry;
   detection_path: StatusEntry;
+  youtube_detection: StatusEntry;
   llm: StatusEntry;
   lastfm: StatusEntry;
   getsongbpm: StatusEntry;

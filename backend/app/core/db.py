@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, create_engine
@@ -14,7 +16,13 @@ def _enable_sqlite_foreign_keys(dbapi_connection, connection_record) -> None:
     cursor.close()
 
 
+@lru_cache
 def get_engine():
+    # One Engine (and its connection pool) for the process lifetime — settings
+    # are themselves cached (get_settings), so there's nothing to re-read per
+    # call. Un-cached, every request built a fresh pool from scratch, which
+    # would mean a new TCP+auth handshake per request once this cuts over to
+    # Postgres (KTD2).
     return create_engine(get_settings().database_url)
 
 

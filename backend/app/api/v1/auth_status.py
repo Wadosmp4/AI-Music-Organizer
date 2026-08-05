@@ -23,6 +23,11 @@ class StatusResponse(BaseModel):
 class AuthStatusResponse(BaseModel):
     write_path: StatusResponse
     detection_path: StatusResponse
+    # Set by the ingestion check (jobs/ingestion.py) whenever the last
+    # get_liked_songs() call failed for any reason — a superset of
+    # detection_path's OAuth-token-specific failures, also covering plain
+    # network errors during that call.
+    youtube_detection: StatusResponse
     llm: StatusResponse
     lastfm: StatusResponse
     getsongbpm: StatusResponse
@@ -32,6 +37,9 @@ class AuthStatusResponse(BaseModel):
 def get_auth_status() -> AuthStatusResponse:
     write_status, write_reason = auth_status_store.get_write_status()
     detection_status, detection_reason = auth_status_store.get_detection_status()
+    youtube_detection_status, youtube_detection_reason = dependency_health_store.get_status(
+        "youtube_detection"
+    )
     llm_status, llm_reason = dependency_health_store.get_status("llm")
     lastfm_status, lastfm_reason = dependency_health_store.get_status("lastfm")
     bpm_status, bpm_reason = dependency_health_store.get_status("getsongbpm")
@@ -39,6 +47,9 @@ def get_auth_status() -> AuthStatusResponse:
     return AuthStatusResponse(
         write_path=StatusResponse(status=write_status.value, reason=write_reason),
         detection_path=StatusResponse(status=detection_status.value, reason=detection_reason),
+        youtube_detection=StatusResponse(
+            status=youtube_detection_status.value, reason=youtube_detection_reason
+        ),
         llm=StatusResponse(status=llm_status.value, reason=llm_reason),
         lastfm=StatusResponse(status=lastfm_status.value, reason=lastfm_reason),
         getsongbpm=StatusResponse(status=bpm_status.value, reason=bpm_reason),

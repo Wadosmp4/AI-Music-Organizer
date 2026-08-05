@@ -3,6 +3,7 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from app.models.genre_cache import GenreCacheEntry
+from app.repositories.base import save
 
 
 class GenreCacheRepository:
@@ -20,7 +21,4 @@ class GenreCacheRepository:
             entry = GenreCacheEntry(artist=artist, genre=genre)
         else:
             entry.genre = genre
-        self.session.add(entry)
-        self.session.commit()
-        self.session.refresh(entry)
-        return entry
+        return save(self.session, entry)

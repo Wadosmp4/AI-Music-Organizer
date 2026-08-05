@@ -43,6 +43,7 @@ export function Settings() {
           <ul>
             <li>Write path (playlist edits): {authStatus.write_path.status}</li>
             <li>Detection path (new likes): {authStatus.detection_path.status}</li>
+            <li>Last ingestion check: {authStatus.youtube_detection.status}</li>
             <li>LLM classification: {authStatus.llm.status}</li>
             <li>Last.fm genre lookup: {authStatus.lastfm.status}</li>
             <li>GetSongBPM tempo lookup: {authStatus.getsongbpm.status}</li>

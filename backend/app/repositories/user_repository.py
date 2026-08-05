@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
 from typing import Optional
 
 from sqlmodel import Session
 
+from app.models.base import utcnow
 from app.models.user import User
+from app.repositories.base import save
 
 
 class UserRepository:
@@ -14,23 +15,15 @@ class UserRepository:
         return self.session.get(User, user_id)
 
     def create(self, user: User) -> User:
-        self.session.add(user)
-        self.session.commit()
-        self.session.refresh(user)
-        return user
+        return save(self.session, user)
+
+    def _mark_timestamp(self, user_id: int, field: str) -> User:
+        user = self.get(user_id)
+        setattr(user, field, utcnow())
+        return save(self.session, user)
 
     def mark_onboarding_completed(self, user_id: int) -> User:
-        user = self.get(user_id)
-        user.onboarding_completed_at = datetime.now(timezone.utc)
-        self.session.add(user)
-        self.session.commit()
-        self.session.refresh(user)
-        return user
+        return self._mark_timestamp(user_id, "onboarding_completed_at")
 
     def mark_backfill_completed(self, user_id: int) -> User:
-        user = self.get(user_id)
-        user.backfill_completed_at = datetime.now(timezone.utc)
-        self.session.add(user)
-        self.session.commit()
-        self.session.refresh(user)
-        return user
+        return self._mark_timestamp(user_id, "backfill_completed_at")

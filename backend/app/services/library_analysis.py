@@ -11,7 +11,6 @@ get set, which U4 checks before it starts classifying (F5 step 4).
 """
 
 import json
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -20,23 +19,19 @@ from litellm import completion
 from pydantic import BaseModel, ValidationError
 
 from app.integrations.http_client import CircuitBreaker, call_with_retry
-from app.models.library import LibraryItem
 from app.models.playlist import Playlist
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
 from app.services.genre_lookup import GenreLookupService
+from app.services.unplaced import unplaced_library_items
 
 litellm.suppress_debug_info = True
 
 CLUSTERING_MODEL = "openrouter/google/gemini-2.5-flash"
 BATCH_SIZE = 150  # a single call over thousands of tracks overflows the model's output budget
 MIN_CLUSTER_SIZE = 4  # ported from organize_music.py — minimum songs to justify a new playlist
-
-# Statuses that mean a library item is already spoken for — everything else
-# (including a never-seen library item) counts as "unplaced" for clustering.
-_PLACED_STATUSES = {"pending", "write_pending", "approved", "moved"}
 
 SYSTEM_PROMPT = """
 You are organizing a YouTube Music library into playlists.
@@ -103,23 +98,13 @@ class LibraryAnalysisService:
     def list_existing_playlists(self, user_id: int) -> list[Playlist]:
         return self.playlist_repository.list_for_user(user_id)
 
-    def _unplaced_library_items(self, user_id: int) -> list[LibraryItem]:
-        placed_ids = {
-            item.library_item_id
-            for item in self.review_queue_repository.list_for_user(user_id)
-            if item.status in _PLACED_STATUSES
-        }
-        return [
-            item
-            for item in self.library_repository.list_for_user(user_id)
-            if item.id not in placed_ids
-        ]
-
     def propose_new_playlists(self, user_id: int) -> list[PlaylistProposal]:
         if not self.openrouter_api_key:
             return []
 
-        unplaced = self._unplaced_library_items(user_id)
+        unplaced = unplaced_library_items(
+            user_id, self.library_repository, self.review_queue_repository
+        )
         if not unplaced:
             return []
 

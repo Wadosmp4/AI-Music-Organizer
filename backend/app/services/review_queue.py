@@ -8,13 +8,14 @@ raised (KTD17), rather than being left stuck as if applied.
 """
 
 from app.integrations.auth_status import AuthStatus, auth_status_store
-from app.integrations.base import MusicServiceClient
+from app.integrations.base import MusicServiceClient, track_from_library_item
 from app.models.correction_log import CorrectionLogEntry
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
-from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
+from app.repositories.review_queue_repository import ReviewQueueRepository
+from app.services.classification import build_correction_context
 
 
 class StaleItemError(Exception):
@@ -119,6 +120,11 @@ class ReviewQueueService:
                 review_queue_item_id=item.id,
                 original_playlist_id=old_playlist_id,
                 corrected_playlist_id=new_playlist_id,
+                # genre omitted: fetching it here would add a synchronous
+                # Last.fm call to a user-facing write action; artist_bucket_key
+                # (populated below) is _correction_boosts' primary match key,
+                # KTD12's genre-scoped matching is a secondary path only.
+                context=build_correction_context(track_from_library_item(library_item), genre=None),
             )
         )
         return moved_item

@@ -5,9 +5,12 @@ so every request acts on behalf of one fixed account (DEFAULT_USER_ID) rather
 than an authenticated principal.
 """
 
+from dataclasses import dataclass
+
 from fastapi import Depends
 from sqlmodel import Session
 
+from app.core.config import get_settings
 from app.core.db import get_session
 from app.integrations.base import MusicServiceClient
 from app.integrations.ytmusic_client import YTMusicClient
@@ -17,7 +20,6 @@ from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
-from app.core.config import get_settings
 from app.services.bpm_lookup import BpmLookupService
 from app.services.classification import ClassificationService
 from app.services.genre_lookup import GenreLookupService
@@ -88,4 +90,26 @@ def get_library_analysis_service(session: Session = Depends(get_session)) -> Lib
         user_repository=UserRepository(session),
         genre_lookup=GenreLookupService(session),
         openrouter_api_key=get_settings().openrouter_api_key,
+    )
+
+
+@dataclass
+class IngestionDependencies:
+    """Bundles the repositories `run_ingestion_check` needs — it's a plain
+    function, not a service class, but still gets its repository wiring from
+    this one factory like every other route, rather than constructing them
+    inline."""
+
+    library_repository: LibraryRepository
+    playlist_repository: PlaylistRepository
+    review_queue_repository: ReviewQueueRepository
+    user_repository: UserRepository
+
+
+def get_ingestion_dependencies(session: Session = Depends(get_session)) -> IngestionDependencies:
+    return IngestionDependencies(
+        library_repository=LibraryRepository(session),
+        playlist_repository=PlaylistRepository(session),
+        review_queue_repository=ReviewQueueRepository(session),
+        user_repository=UserRepository(session),
     )

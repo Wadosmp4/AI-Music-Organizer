@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
 from typing import Optional
 
 from sqlmodel import Session, select
 
+from app.models.base import utcnow
 from app.models.library import LibraryItem
+from app.repositories.base import save
 
 
 class LibraryRepository:
@@ -19,11 +20,8 @@ class LibraryRepository:
         item = self.get(item_id)
         if item is None:
             return None
-        item.removed_at = datetime.now(timezone.utc)
-        self.session.add(item)
-        self.session.commit()
-        self.session.refresh(item)
-        return item
+        item.removed_at = utcnow()
+        return save(self.session, item)
 
     def get_by_video_id(self, video_id: str) -> Optional[LibraryItem]:
         return self.session.exec(
@@ -31,10 +29,7 @@ class LibraryRepository:
         ).first()
 
     def create(self, item: LibraryItem) -> LibraryItem:
-        self.session.add(item)
-        self.session.commit()
-        self.session.refresh(item)
-        return item
+        return save(self.session, item)
 
     def list_for_user(self, user_id: int) -> list[LibraryItem]:
         return list(

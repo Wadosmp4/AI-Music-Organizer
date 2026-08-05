@@ -7,6 +7,11 @@ from app.api.deps import DEFAULT_USER_ID, get_review_queue_service
 from app.repositories.review_queue_repository import VersionConflictError
 from app.services.review_queue import ItemNotFoundError, ReviewQueueService, StaleItemError
 
+# Raised by the service layer and mapped to their HTTP status uniformly by
+# the handlers registered in main.py — must propagate past this route's own
+# generic except-Exception below, not be swallowed into a 502.
+_DOMAIN_EXCEPTIONS = (ItemNotFoundError, StaleItemError, VersionConflictError)
+
 router = APIRouter(prefix="/review-queue", tags=["review-queue"])
 
 
@@ -48,12 +53,8 @@ def approve(
 ):
     try:
         return service.approve(item_id, body.expected_version)
-    except ItemNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except StaleItemError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except VersionConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except _DOMAIN_EXCEPTIONS:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"write failed: {exc}")
 
@@ -64,10 +65,7 @@ def reject(
     body: RejectRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
 ):
-    try:
-        return service.reject(item_id, body.expected_version)
-    except VersionConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    return service.reject(item_id, body.expected_version)
 
 
 @router.post("/{item_id}/move", response_model=ReviewQueueItemResponse)
@@ -78,11 +76,7 @@ def move(
 ):
     try:
         return service.move(item_id, body.expected_version, body.new_playlist_id)
-    except ItemNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except StaleItemError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except VersionConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    except _DOMAIN_EXCEPTIONS:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"write failed: {exc}")
