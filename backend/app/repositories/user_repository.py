@@ -1,6 +1,7 @@
+from datetime import datetime, timezone
 from typing import Optional
 
-from sqlmodel import Session, select
+from sqlmodel import Session
 
 from app.models.user import User
 
@@ -13,6 +14,14 @@ class UserRepository:
         return self.session.get(User, user_id)
 
     def create(self, user: User) -> User:
+        self.session.add(user)
+        self.session.commit()
+        self.session.refresh(user)
+        return user
+
+    def mark_onboarding_completed(self, user_id: int) -> User:
+        user = self.get(user_id)
+        user.onboarding_completed_at = datetime.now(timezone.utc)
         self.session.add(user)
         self.session.commit()
         self.session.refresh(user)

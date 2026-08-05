@@ -17,9 +17,11 @@ from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
+from app.core.config import get_settings
 from app.services.bpm_lookup import BpmLookupService
 from app.services.classification import ClassificationService
 from app.services.genre_lookup import GenreLookupService
+from app.services.library_analysis import LibraryAnalysisService
 from app.services.playlist_creation import PlaylistCreationService
 from app.services.review_queue import ReviewQueueService
 
@@ -75,4 +77,15 @@ def get_playlist_creation_service(
         library_repository=LibraryRepository(session),
         review_queue_repository=ReviewQueueRepository(session),
         classification_service=classification_service,
+    )
+
+
+def get_library_analysis_service(session: Session = Depends(get_session)) -> LibraryAnalysisService:
+    return LibraryAnalysisService(
+        library_repository=LibraryRepository(session),
+        playlist_repository=PlaylistRepository(session),
+        review_queue_repository=ReviewQueueRepository(session),
+        user_repository=UserRepository(session),
+        genre_lookup=GenreLookupService(session),
+        openrouter_api_key=get_settings().openrouter_api_key,
     )
