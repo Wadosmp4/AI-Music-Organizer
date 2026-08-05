@@ -82,6 +82,9 @@ class PlaylistCreationService:
                     explanation={
                         "signal": result.explanation.signal,
                         "detail": result.explanation.detail,
+                        "bpm": result.bpm,
+                        "bpm_source": result.bpm_source,
+                        "genre": result.genre,
                     },
                 )
             )

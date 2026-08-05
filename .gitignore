@@ -13,6 +13,8 @@ backend/data/
 
 # Node
 node_modules/
+dist/
+*.tsbuildinfo
 
 # Legacy script run artifacts (regenerated locally, not source)
 plan.json

@@ -138,6 +138,9 @@ def run_ingestion_check(
                 explanation={
                     "signal": result.explanation.signal,
                     "detail": result.explanation.detail,
+                    "bpm": result.bpm,
+                    "bpm_source": result.bpm_source,
+                    "genre": result.genre,
                 },
             )
         )
