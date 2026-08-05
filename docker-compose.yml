@@ -1,0 +1,28 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////app/data/app.db
+    volumes:
+      - sqlite_data:/app/data
+    # Pinned at 1 (KTD22/KTD26): the ingestion job (U4) runs as a single
+    # dedicated process. A second replica would double-fire every job.
+    deploy:
+      replicas: 1
+
+  # Stub only — U8 adds web/Dockerfile and fleshes this out into the real
+  # React dev/build service. Under the "web" profile so a plain
+  # `docker compose up` (U1's scope: backend only) doesn't try to build it.
+  # web:
+  #   build: ./web
+  #   ports:
+  #     - "5173:5173"
+  #   depends_on:
+  #     - backend
+  #   profiles:
+  #     - web
+
+volumes:
+  sqlite_data:

@@ -8,6 +8,8 @@ yt_data_token.json
 .venv/
 __pycache__/
 *.pyc
+backend/data/
+.pytest_cache/
 
 # Node
 node_modules/
