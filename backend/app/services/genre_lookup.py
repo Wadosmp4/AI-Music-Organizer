@@ -10,7 +10,7 @@ from sqlmodel import Session
 
 from app.core.config import get_settings
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
-from app.integrations.http_client import CircuitBreaker, call_with_retry
+from app.integrations.http_client import CircuitBreaker, CircuitOpenError, call_with_retry
 from app.repositories.genre_cache_repository import GenreCacheRepository
 
 API_URL = "https://ws.audioscrobbler.com/2.0/"
@@ -45,9 +45,12 @@ class GenreLookupService:
 
         try:
             genre = self._fetch(artist)
-        except (requests.RequestException, ValueError) as exc:
-            # A timeout/rate-limit is distinguishable from a genuine miss (KTD18):
-            # surface degraded health, but don't cache a failure as "no genre."
+        except (requests.RequestException, ValueError, CircuitOpenError) as exc:
+            # A timeout/rate-limit/tripped-breaker is distinguishable from a
+            # genuine miss (KTD18): surface degraded health, but don't cache a
+            # failure as "no genre." CircuitOpenError must be caught here too
+            # — it's raised by call_with_retry's circuit_breaker.before_call(),
+            # not by the request itself, so it isn't a requests.RequestException.
             dependency_health_store.set_status(
                 "lastfm", DependencyStatus.DEGRADED, f"Last.fm lookup failed: {exc}"
             )

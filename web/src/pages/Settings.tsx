@@ -44,7 +44,9 @@ export function Settings() {
             <li>Write path (playlist edits): {authStatus.write_path.status}</li>
             <li>Detection path (new likes): {authStatus.detection_path.status}</li>
             <li>Last ingestion check: {authStatus.youtube_detection.status}</li>
-            <li>LLM classification: {authStatus.llm.status}</li>
+            <li>LLM BPM estimate: {authStatus.llm_bpm_estimate.status}</li>
+            <li>LLM description match: {authStatus.llm_description_match.status}</li>
+            <li>LLM playlist clustering: {authStatus.llm_clustering.status}</li>
             <li>Last.fm genre lookup: {authStatus.lastfm.status}</li>
             <li>GetSongBPM tempo lookup: {authStatus.getsongbpm.status}</li>
           </ul>

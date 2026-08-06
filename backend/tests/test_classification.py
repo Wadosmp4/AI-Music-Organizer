@@ -13,7 +13,9 @@ from app.services.genre_lookup import GenreLookupService
 def reset_dependency_health():
     dependency_health_store.set_status("lastfm", DependencyStatus.OK)
     dependency_health_store.set_status("getsongbpm", DependencyStatus.OK)
-    dependency_health_store.set_status("llm", DependencyStatus.OK)
+    dependency_health_store.set_status("llm_bpm_estimate", DependencyStatus.OK)
+    dependency_health_store.set_status("llm_description_match", DependencyStatus.OK)
+    dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
     yield
 
 
@@ -90,6 +92,37 @@ def test_bpm_network_timeout_surfaces_degraded_health():
     status, reason = dependency_health_store.get_status("getsongbpm")
     assert status == DependencyStatus.DEGRADED
     assert "timed out" in reason.lower() or "failed" in reason.lower()
+
+
+def test_bpm_tripped_circuit_breaker_is_distinguishable_from_genuine_miss():
+    """CircuitOpenError is raised by call_with_retry's circuit_breaker.before_call(),
+    not by the request itself — it must be caught alongside requests.RequestException
+    or it escapes _lookup_measured uncaught (KTD18)."""
+    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
+    for _ in range(bpm_service._circuit_breaker.failure_threshold):
+        bpm_service._circuit_breaker.record_failure()
+
+    result = bpm_service.lookup_bpm("Artist", "Title")
+
+    assert result.bpm is None
+    status, reason = dependency_health_store.get_status("getsongbpm")
+    assert status == DependencyStatus.DEGRADED
+    assert "circuit" in reason.lower()
+
+
+def test_bpm_malformed_tempo_field_surfaces_degraded_health_instead_of_raising():
+    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
+    fake_response = MagicMock(status_code=200)
+    fake_response.raise_for_status.return_value = None
+    fake_response.json.return_value = {"search": [{"tempo": "not-a-number"}]}
+
+    with patch("app.services.bpm_lookup.requests.get", return_value=fake_response):
+        result = bpm_service.lookup_bpm("Artist", "Title")
+
+    assert result.bpm is None
+    status, reason = dependency_health_store.get_status("getsongbpm")
+    assert status == DependencyStatus.DEGRADED
+    assert "tempo" in reason.lower()
 
 
 def test_rule_gated_playlist_ignores_description_only_match():
@@ -191,3 +224,19 @@ def test_genre_lookup_caches_to_the_database_not_a_file(session):
 
     assert first == second == "synthpop"
     mock_get.assert_called_once()  # second call served from the DB-backed cache (KTD23)
+
+
+def test_genre_lookup_tripped_circuit_breaker_is_distinguishable_from_genuine_miss(session):
+    """Same CircuitOpenError gap as bpm_lookup.py's _lookup_measured — it's
+    raised by call_with_retry's circuit_breaker.before_call(), not by the
+    request itself, so it must be caught alongside requests.RequestException."""
+    genre_service = GenreLookupService(session, api_key="test-key")
+    for _ in range(genre_service._circuit_breaker.failure_threshold):
+        genre_service._circuit_breaker.record_failure()
+
+    result = genre_service.genre_for("Some New Artist")
+
+    assert result is None
+    status, reason = dependency_health_store.get_status("lastfm")
+    assert status == DependencyStatus.DEGRADED
+    assert "circuit" in reason.lower()

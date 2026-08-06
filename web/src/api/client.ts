@@ -32,7 +32,9 @@ export interface AuthStatus {
   write_path: StatusEntry;
   detection_path: StatusEntry;
   youtube_detection: StatusEntry;
-  llm: StatusEntry;
+  llm_bpm_estimate: StatusEntry;
+  llm_description_match: StatusEntry;
+  llm_clustering: StatusEntry;
   lastfm: StatusEntry;
   getsongbpm: StatusEntry;
 }
@@ -51,6 +53,16 @@ export interface ExistingPlaylist {
   rule: Record<string, unknown> | null;
 }
 
+// Matches the backend's CreatedPlaylistResponse (app/api/v1/onboarding.py) —
+// distinct from ExistingPlaylist because a freshly created playlist never
+// carries a `rule` (only playlists with a structured hard-gate rule do, and
+// onboarding selection never sets one).
+export interface CreatedPlaylist {
+  id: number;
+  name: string;
+  description: string | null;
+}
+
 export interface OnboardingAnalysis {
   proposals: PlaylistProposal[];
   existing_playlists: ExistingPlaylist[];
@@ -58,7 +70,11 @@ export interface OnboardingAnalysis {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
+    // X-Requested-With: the backend's CSRF guard (app/main.py) requires this
+    // on every mutating request — a genuine cross-origin caller can't add a
+    // custom header without triggering a CORS preflight, which no CORS
+    // policy exists to satisfy.
+    headers: { "Content-Type": "application/json", "X-Requested-With": "XMLHttpRequest" },
     ...init,
   });
   if (!response.ok) {
@@ -118,7 +134,7 @@ export function fetchOnboardingAnalysis(): Promise<OnboardingAnalysis> {
 export function submitOnboardingSelection(
   acceptedProposals: { name: string; theme: string }[],
   customPlaylists: { name: string; description: string }[],
-): Promise<{ created_playlists: ExistingPlaylist[] }> {
+): Promise<{ created_playlists: CreatedPlaylist[] }> {
   return request("/onboarding/select", {
     method: "POST",
     body: JSON.stringify({

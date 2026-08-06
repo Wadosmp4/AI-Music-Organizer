@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+from app.integrations.base import MusicServiceClient
+from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
 from app.models.user import User
@@ -30,12 +32,19 @@ def _add_library_items(session, user_id, songs):
     return items
 
 
-def _service(session, openrouter_api_key="or-key") -> LibraryAnalysisService:
+def _fake_music_client() -> MagicMock:
+    music_client = MagicMock(spec=MusicServiceClient)
+    music_client.create_playlist.return_value = "yt-playlist-fake-id"
+    return music_client
+
+
+def _service(session, openrouter_api_key="or-key", music_client=None) -> LibraryAnalysisService:
     return LibraryAnalysisService(
         library_repository=LibraryRepository(session),
         playlist_repository=PlaylistRepository(session),
         review_queue_repository=ReviewQueueRepository(session),
         user_repository=UserRepository(session),
+        music_client=music_client or _fake_music_client(),
         genre_lookup=None,
         openrouter_api_key=openrouter_api_key,
     )
@@ -73,6 +82,58 @@ def test_cluster_of_related_unplaced_songs_produces_a_new_playlist_proposal(sess
     assert proposals[0].song_count == 4
 
 
+def test_cluster_success_surfaces_llm_clustering_health_as_ok(session):
+    user = _make_user(session)
+    _add_library_items(
+        session,
+        user.id,
+        [
+            ("v1", "Song 1", "Artist A"),
+            ("v2", "Song 2", "Artist B"),
+            ("v3", "Song 3", "Artist C"),
+            ("v4", "Song 4", "Artist D"),
+        ],
+    )
+    dependency_health_store.set_status("llm_clustering", DependencyStatus.DEGRADED, "stale")
+    service = _service(session)
+
+    mock_response = _mock_cluster_response("Chill", "chill songs", [0, 1, 2, 3])
+    with patch("app.services.library_analysis.completion", return_value=mock_response):
+        service.propose_new_playlists(user.id)
+
+    status, _ = dependency_health_store.get_status("llm_clustering")
+    assert status == DependencyStatus.OK
+
+
+def test_cluster_batch_empty_choices_list_surfaces_degraded_health_instead_of_raising(session):
+    """An empty `choices` list (e.g. a safety-filtered response) raises
+    IndexError on resp.choices[0] — previously outside the narrow except
+    tuple, so it would have escaped _cluster_batch entirely instead of being
+    treated like any other per-batch clustering failure (KTD18)."""
+    user = _make_user(session)
+    _add_library_items(
+        session,
+        user.id,
+        [
+            ("v1", "Song 1", "Artist A"),
+            ("v2", "Song 2", "Artist B"),
+            ("v3", "Song 3", "Artist C"),
+            ("v4", "Song 4", "Artist D"),
+        ],
+    )
+    service = _service(session)
+
+    empty_choices_response = MagicMock()
+    empty_choices_response.choices = []
+    with patch("app.services.library_analysis.completion", return_value=empty_choices_response):
+        proposals = service.propose_new_playlists(user.id)
+
+    assert proposals == []
+    status, reason = dependency_health_store.get_status("llm_clustering")
+    assert status == DependencyStatus.DEGRADED
+    assert "clustering" in reason.lower()
+
+
 def test_existing_playlists_shown_for_context_but_not_modified(session):
     user = _make_user(session)
     existing = PlaylistRepository(session).create(
@@ -104,6 +165,7 @@ def test_selecting_a_proposed_candidate_creates_an_empty_playlist_with_no_songs(
     playlist = PlaylistRepository(session).get(created[0].id)
     assert playlist.name == "Chill Electronic"
     assert playlist.description == "Laid-back electronic songs"
+    assert playlist.youtube_playlist_id == "yt-playlist-fake-id"
     assert ReviewQueueRepository(session).list_for_user(user.id) == []
 
 
@@ -121,6 +183,7 @@ def test_custom_playlist_added_during_onboarding_creates_an_empty_playlist_the_s
     playlist = PlaylistRepository(session).get(created[0].id)
     assert playlist.name == "Road Trip"
     assert playlist.description == "upbeat driving songs"
+    assert playlist.youtube_playlist_id == "yt-playlist-fake-id"
     assert ReviewQueueRepository(session).list_for_user(user.id) == []
 
 

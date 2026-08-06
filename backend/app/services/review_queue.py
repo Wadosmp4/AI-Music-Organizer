@@ -7,6 +7,8 @@ failure the item returns to `pending` and the write-path health status is
 raised (KTD17), rather than being left stuck as if applied.
 """
 
+import logging
+
 from app.integrations.auth_status import AuthStatus, auth_status_store
 from app.integrations.base import MusicServiceClient, track_from_library_item
 from app.models.correction_log import CorrectionLogEntry
@@ -14,8 +16,10 @@ from app.models.review_queue import ReviewQueueItem
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
-from app.repositories.review_queue_repository import ReviewQueueRepository
+from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
 from app.services.classification import build_correction_context
+
+logger = logging.getLogger(__name__)
 
 
 class StaleItemError(Exception):
@@ -66,25 +70,63 @@ class ReviewQueueService:
             raise ItemNotFoundError(f"playlist {playlist_id} has no linked YouTube playlist")
         return playlist.youtube_playlist_id
 
+    def _complete_pending_write(
+        self,
+        pending_item: ReviewQueueItem,
+        final_status: str,
+        write_succeeded: bool,
+        **extra_fields,
+    ) -> ReviewQueueItem:
+        """Finalizes a write_pending item's outcome via CAS on the version
+        captured when it entered write_pending. If a concurrent ingestion
+        staleness update (jobs/ingestion.py) has already claimed this row in
+        the meantime (KTD19), that version is gone and this CAS raises
+        VersionConflictError — indistinguishable, at the client, from an
+        ordinary optimistic-concurrency conflict, but semantically different:
+        the external write's real outcome (recorded in `write_succeeded`) is
+        now orphaned, since the row never reached `final_status`. Logged here
+        so it's diagnosable, then re-raised — the existing 409 contract for
+        VersionConflictError is unchanged.
+        """
+        try:
+            return self.review_queue_repo.update(
+                pending_item.id, pending_item.version, status=final_status, **extra_fields
+            )
+        except VersionConflictError:
+            logger.warning(
+                "review_queue_item %s: write %s but the completion CAS "
+                "(write_pending -> %s) lost a race to a concurrent update "
+                "(likely ingestion staleness marking) — the item's final "
+                "status does not reflect this write's real outcome.",
+                pending_item.id,
+                "succeeded" if write_succeeded else "failed",
+                final_status,
+            )
+            raise
+
     def approve(self, item_id: int, expected_version: int) -> ReviewQueueItem:
         item = self._require_item(item_id)
         self._check_not_stale(item)
 
+        # Resolved before the write_pending CAS: a missing youtube_playlist_id
+        # is a data problem (the destination playlist was never linked), not a
+        # write-path failure — it must raise ItemNotFoundError untouched, not
+        # get caught by the except below and misreported as auth_status
+        # NEEDS_RECONNECT.
+        youtube_playlist_id = self._youtube_playlist_id(item.playlist_id)
         library_item = self.library_repo.get(item.library_item_id)
         pending_item = self.review_queue_repo.update(item_id, expected_version, status="write_pending")
 
         try:
-            self.music_client.add_playlist_items(
-                self._youtube_playlist_id(pending_item.playlist_id), [library_item.video_id]
-            )
+            self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
         except Exception as exc:
             auth_status_store.set_write_status(
                 AuthStatus.NEEDS_RECONNECT, f"approve write failed: {exc}"
             )
-            self.review_queue_repo.update(pending_item.id, pending_item.version, status="pending")
+            self._complete_pending_write(pending_item, "pending", write_succeeded=False)
             raise
 
-        return self.review_queue_repo.update(pending_item.id, pending_item.version, status="approved")
+        return self._complete_pending_write(pending_item, "approved", write_succeeded=True)
 
     def reject(self, item_id: int, expected_version: int) -> ReviewQueueItem:
         return self.review_queue_repo.update(item_id, expected_version, status="rejected")
@@ -94,25 +136,28 @@ class ReviewQueueService:
         self._check_not_stale(item)
 
         old_playlist_id = item.playlist_id
+        # Resolved before the write_pending CAS — see the matching comment in
+        # approve(): a missing youtube_playlist_id on the destination playlist
+        # must raise ItemNotFoundError untouched, not get mislabeled as a
+        # write-path auth failure.
+        youtube_playlist_id = self._youtube_playlist_id(new_playlist_id)
         library_item = self.library_repo.get(item.library_item_id)
         pending_item = self.review_queue_repo.update(
             item_id, expected_version, status="write_pending", playlist_id=new_playlist_id
         )
 
         try:
-            self.music_client.add_playlist_items(
-                self._youtube_playlist_id(new_playlist_id), [library_item.video_id]
-            )
+            self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
         except Exception as exc:
             auth_status_store.set_write_status(
                 AuthStatus.NEEDS_RECONNECT, f"move write failed: {exc}"
             )
-            self.review_queue_repo.update(
-                pending_item.id, pending_item.version, status="pending", playlist_id=old_playlist_id
+            self._complete_pending_write(
+                pending_item, "pending", write_succeeded=False, playlist_id=old_playlist_id
             )
             raise
 
-        moved_item = self.review_queue_repo.update(pending_item.id, pending_item.version, status="moved")
+        moved_item = self._complete_pending_write(pending_item, "moved", write_succeeded=True)
 
         self.correction_log_repo.create(
             CorrectionLogEntry(

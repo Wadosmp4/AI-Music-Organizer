@@ -98,8 +98,12 @@ def run_ingestion_check(
     all_new_songs = [
         s for s in liked_songs if s.get("videoId") and s["videoId"] not in existing_video_ids
     ]
-    limit = BACKFILL_BATCH_SIZE if is_backfill else None
-    new_songs = all_new_songs[:limit] if limit is not None else all_new_songs
+    # Bounded unconditionally, not just during backfill: without a scheduler
+    # (KTD5), a user who returns after time away and likes many songs at once
+    # would otherwise hit this same steady-state check with an unbounded
+    # batch, defeating the rate-limit protection this cap exists for.
+    limit = BACKFILL_BATCH_SIZE
+    new_songs = all_new_songs[:limit]
 
     candidates = [
         CandidatePlaylist.from_playlist(p) for p in playlist_repository.list_for_user(user_id)
@@ -107,6 +111,17 @@ def run_ingestion_check(
 
     queue_items_created = 0
     for song in new_songs:
+        try:
+            result = classification_service.classify_track(song, candidates, user_id=user_id)
+        except Exception:
+            # KTD18: this song's failure never blocks the rest of the check.
+            # The LibraryItem row is deliberately NOT created here — creating
+            # it before classification, then skipping on failure, would add
+            # the video_id to existing_video_ids and make the next check
+            # believe this song was already handled, silently orphaning it
+            # forever instead of actually retrying it as intended.
+            continue
+
         library_item = library_repository.create(
             LibraryItem(
                 user_id=user_id,
@@ -115,12 +130,6 @@ def run_ingestion_check(
                 artist=track_artist(song),
             )
         )
-        try:
-            result = classification_service.classify_track(song, candidates, user_id=user_id)
-        except Exception:
-            # KTD18: this song's failure never blocks the rest of the check —
-            # it stays unclassified and the next check call retries it.
-            continue
 
         if result.playlist_id is None:
             continue
@@ -137,7 +146,7 @@ def run_ingestion_check(
         queue_items_created += 1
 
     backfill_complete = False
-    if is_backfill and len(all_new_songs) <= (limit or 0):
+    if is_backfill and len(all_new_songs) <= limit:
         user_repository.mark_backfill_completed(user_id)
         backfill_complete = True
 

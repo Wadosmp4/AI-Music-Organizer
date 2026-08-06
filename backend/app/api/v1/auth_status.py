@@ -28,7 +28,13 @@ class AuthStatusResponse(BaseModel):
     # detection_path's OAuth-token-specific failures, also covering plain
     # network errors during that call.
     youtube_detection: StatusResponse
-    llm: StatusResponse
+    # Three independent LLM use cases (KTD17/18: never blend independently-
+    # surfaced health signals) — a persistent failure in one (e.g. clustering)
+    # must not be masked by another (e.g. description-match) succeeding right
+    # after it against the same shared health-store key.
+    llm_bpm_estimate: StatusResponse
+    llm_description_match: StatusResponse
+    llm_clustering: StatusResponse
     lastfm: StatusResponse
     getsongbpm: StatusResponse
 
@@ -40,7 +46,9 @@ def get_auth_status() -> AuthStatusResponse:
     youtube_detection_status, youtube_detection_reason = dependency_health_store.get_status(
         "youtube_detection"
     )
-    llm_status, llm_reason = dependency_health_store.get_status("llm")
+    llm_bpm_status, llm_bpm_reason = dependency_health_store.get_status("llm_bpm_estimate")
+    llm_desc_status, llm_desc_reason = dependency_health_store.get_status("llm_description_match")
+    llm_cluster_status, llm_cluster_reason = dependency_health_store.get_status("llm_clustering")
     lastfm_status, lastfm_reason = dependency_health_store.get_status("lastfm")
     bpm_status, bpm_reason = dependency_health_store.get_status("getsongbpm")
 
@@ -50,7 +58,9 @@ def get_auth_status() -> AuthStatusResponse:
         youtube_detection=StatusResponse(
             status=youtube_detection_status.value, reason=youtube_detection_reason
         ),
-        llm=StatusResponse(status=llm_status.value, reason=llm_reason),
+        llm_bpm_estimate=StatusResponse(status=llm_bpm_status.value, reason=llm_bpm_reason),
+        llm_description_match=StatusResponse(status=llm_desc_status.value, reason=llm_desc_reason),
+        llm_clustering=StatusResponse(status=llm_cluster_status.value, reason=llm_cluster_reason),
         lastfm=StatusResponse(status=lastfm_status.value, reason=lastfm_reason),
         getsongbpm=StatusResponse(status=bpm_status.value, reason=bpm_reason),
     )

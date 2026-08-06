@@ -11,7 +11,9 @@ const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
   detection_path: { status: "ok", reason: null },
   youtube_detection: { status: "ok", reason: null },
-  llm: { status: "ok", reason: null },
+  llm_bpm_estimate: { status: "ok", reason: null },
+  llm_description_match: { status: "ok", reason: null },
+  llm_clustering: { status: "ok", reason: null },
   lastfm: { status: "ok", reason: null },
   getsongbpm: { status: "ok", reason: null },
 };
@@ -51,6 +53,64 @@ describe("ReviewQueue", () => {
       expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
     });
     expect(client.approveItem).toHaveBeenCalledWith(1, 1);
+  });
+
+  it("removes an item from the visible queue after rejecting it", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.rejectItem).mockResolvedValue({ ...item, status: "rejected" });
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Reject"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
+    });
+    expect(client.rejectItem).toHaveBeenCalledWith(1, 1);
+  });
+
+  it("removes an item from the visible queue after moving it to a prompted playlist id", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.moveItem).mockResolvedValue({ ...item, status: "moved", playlist_id: 20 });
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("20");
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Move"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
+    });
+    expect(client.moveItem).toHaveBeenCalledWith(1, 1, 20);
+    promptSpy.mockRestore();
+  });
+
+  it("does not call moveItem when the move prompt is cancelled", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue(null);
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Move"));
+
+    expect(client.moveItem).not.toHaveBeenCalled();
+    expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
+    promptSpy.mockRestore();
   });
 
   it("shows only the write-path banner when just the write path is degraded", async () => {

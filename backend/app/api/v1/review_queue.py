@@ -65,7 +65,12 @@ def reject(
     body: RejectRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
 ):
-    return service.reject(item_id, body.expected_version)
+    try:
+        return service.reject(item_id, body.expected_version)
+    except _DOMAIN_EXCEPTIONS:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"write failed: {exc}")
 
 
 @router.post("/{item_id}/move", response_model=ReviewQueueItemResponse)

@@ -73,21 +73,27 @@ def get_classification_service(session: Session = Depends(get_session)) -> Class
 def get_playlist_creation_service(
     session: Session = Depends(get_session),
     classification_service: ClassificationService = Depends(get_classification_service),
+    music_client: MusicServiceClient = Depends(get_music_client),
 ) -> PlaylistCreationService:
     return PlaylistCreationService(
         playlist_repository=PlaylistRepository(session),
         library_repository=LibraryRepository(session),
         review_queue_repository=ReviewQueueRepository(session),
         classification_service=classification_service,
+        music_client=music_client,
     )
 
 
-def get_library_analysis_service(session: Session = Depends(get_session)) -> LibraryAnalysisService:
+def get_library_analysis_service(
+    session: Session = Depends(get_session),
+    music_client: MusicServiceClient = Depends(get_music_client),
+) -> LibraryAnalysisService:
     return LibraryAnalysisService(
         library_repository=LibraryRepository(session),
         playlist_repository=PlaylistRepository(session),
         review_queue_repository=ReviewQueueRepository(session),
         user_repository=UserRepository(session),
+        music_client=music_client,
         genre_lookup=GenreLookupService(session),
         openrouter_api_key=get_settings().openrouter_api_key,
     )

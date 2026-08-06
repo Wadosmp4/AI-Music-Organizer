@@ -11,7 +11,7 @@ without re-deriving the description.
 
 from dataclasses import dataclass
 
-from app.integrations.base import track_from_library_item
+from app.integrations.base import MusicServiceClient, track_from_library_item
 from app.models.playlist import Playlist
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository
@@ -34,21 +34,33 @@ class PlaylistCreationService:
         library_repository: LibraryRepository,
         review_queue_repository: ReviewQueueRepository,
         classification_service: ClassificationService,
+        music_client: MusicServiceClient,
     ):
         self.playlist_repository = playlist_repository
         self.library_repository = library_repository
         self.review_queue_repository = review_queue_repository
         self.classification_service = classification_service
+        self.music_client = music_client
 
     def create_playlist_and_propose_matches(
         self, user_id: int, name: str, description: str
     ) -> PlaylistCreationResult:
-        """Creates the playlist (with its description persisted, KTD11) and
-        immediately proposes matches against the current library — never
-        auto-applied (R8/R11), only pending review_queue rows.
+        """Creates the playlist on YouTube Music first (a review_queue item
+        that later points at a playlist with no `youtube_playlist_id` can
+        never be approved/moved — the write path requires a real target),
+        persists its description (KTD11), then proposes matches against the
+        current library — never auto-applied (R8/R11), only pending
+        review_queue rows.
         """
+        youtube_playlist_id = self.music_client.create_playlist(name, description)
         playlist = self.playlist_repository.create(
-            Playlist(user_id=user_id, name=name, description=description, rule=None)
+            Playlist(
+                user_id=user_id,
+                name=name,
+                description=description,
+                rule=None,
+                youtube_playlist_id=youtube_playlist_id,
+            )
         )
         created_count = self.propose_matches(user_id, playlist)
         return PlaylistCreationResult(playlist=playlist, review_queue_items_created=created_count)
@@ -71,7 +83,12 @@ class PlaylistCreationService:
         created_count = 0
         for item in library_items:
             track = track_from_library_item(item)
-            result = self.classification_service.classify_track(track, candidates, user_id=user_id)
+            try:
+                result = self.classification_service.classify_track(track, candidates, user_id=user_id)
+            except Exception:
+                # KTD18: one song's failure must not block the rest of this
+                # batch, mirroring jobs/ingestion.py's identical guard.
+                continue
             if result.playlist_id != playlist.id:
                 continue
 

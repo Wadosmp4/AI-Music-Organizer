@@ -278,12 +278,14 @@ class ClassificationService:
             # description-match stage. Caught broadly and deliberately: this is
             # the per-song fault-isolation boundary, so it falls through to "no
             # match" rather than raising and blocking the caller's next song.
+            # Own health-store key (distinct from BPM-estimate/clustering,
+            # KTD17) so one LLM use case's failure can't mask another's.
             dependency_health_store.set_status(
-                "llm", DependencyStatus.DEGRADED, f"description match failed: {exc}"
+                "llm_description_match", DependencyStatus.DEGRADED, f"description match failed: {exc}"
             )
             return None
 
-        dependency_health_store.set_status("llm", DependencyStatus.OK)
+        dependency_health_store.set_status("llm_description_match", DependencyStatus.OK)
         if not matched_name:
             return None
         return next((p for p in candidates if p.name == matched_name), None)

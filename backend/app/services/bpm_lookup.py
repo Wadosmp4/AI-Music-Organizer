@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from app.core.config import get_settings
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
-from app.integrations.http_client import CircuitBreaker, call_with_retry
+from app.integrations.http_client import CircuitBreaker, CircuitOpenError, call_with_retry
 
 litellm.suppress_debug_info = True
 
@@ -72,9 +72,12 @@ class BpmLookupService:
                 retry_on=(requests.RequestException,),
                 circuit_breaker=self._circuit_breaker,
             )
-        except requests.RequestException as exc:
+        except (requests.RequestException, CircuitOpenError) as exc:
             # Distinguishable from a genuine miss (KTD18): surfaced as degraded,
-            # not silently treated as "not found."
+            # not silently treated as "not found." CircuitOpenError must be
+            # caught here too — it's raised by call_with_retry's
+            # circuit_breaker.before_call(), not by the request itself, so
+            # it isn't a requests.RequestException.
             dependency_health_store.set_status(
                 "getsongbpm", DependencyStatus.DEGRADED, f"GetSongBPM lookup failed: {exc}"
             )
@@ -97,7 +100,16 @@ class BpmLookupService:
 
         if not results or "tempo" not in results[0]:
             return None  # genuine miss — this artist/title just isn't in GetSongBPM
-        return float(results[0]["tempo"])
+
+        try:
+            return float(results[0]["tempo"])
+        except (TypeError, ValueError) as exc:
+            # A present-but-malformed tempo field is a response error, not a
+            # genuine miss — must not raise past this method (KTD18).
+            dependency_health_store.set_status(
+                "getsongbpm", DependencyStatus.DEGRADED, f"GetSongBPM malformed tempo field: {exc}"
+            )
+            return None
 
     def _estimate_with_llm(self, artist: str, title: str) -> Optional[float]:
         if not self.openrouter_api_key:
@@ -135,11 +147,13 @@ class BpmLookupService:
             parsed = _BpmEstimate.model_validate_json(raw.strip())
         except Exception as exc:
             # KTD18: caught broadly and deliberately — this is the per-song
-            # fault-isolation boundary for the LLM estimate fallback.
+            # fault-isolation boundary for the LLM estimate fallback. Uses its
+            # own health-store key (distinct from description-match/clustering,
+            # KTD17) so one LLM use case's failure can't mask another's.
             dependency_health_store.set_status(
-                "llm", DependencyStatus.DEGRADED, f"BPM estimate failed: {exc}"
+                "llm_bpm_estimate", DependencyStatus.DEGRADED, f"BPM estimate failed: {exc}"
             )
             return None
 
-        dependency_health_store.set_status("llm", DependencyStatus.OK)
+        dependency_health_store.set_status("llm_bpm_estimate", DependencyStatus.OK)
         return parsed.bpm
