@@ -10,14 +10,15 @@ const NAV_ITEMS: { page: Page; label: string }[] = [
   { page: "settings", label: "Settings" },
 ];
 
-// KTD3: one status-color mapping app-wide.
-const STATUS_DOT_CLASSES: Record<StatusEntry["status"], string> = {
+// KTD3: one status-color mapping app-wide -- shared with Settings.tsx's
+// connection-health rows so both surfaces can never drift apart.
+export const STATUS_DOT_CLASSES: Record<StatusEntry["status"], string> = {
   ok: "bg-emerald-500",
   degraded: "bg-amber-500",
   needs_reconnect: "bg-rose-600",
 };
 
-const STATUS_LABELS: Record<StatusEntry["status"], string> = {
+export const STATUS_LABELS: Record<StatusEntry["status"], string> = {
   ok: "ok",
   degraded: "degraded",
   needs_reconnect: "needs reconnect",

@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 
-import { checkForNewSongs, createPlaylist, fetchAuthStatus, type AuthStatus } from "../api/client";
+import {
+  checkForNewSongs,
+  createPlaylist,
+  fetchAuthStatus,
+  type AuthStatus,
+  type StatusEntry,
+} from "../api/client";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
+import { STATUS_DOT_CLASSES, STATUS_LABELS } from "../components/Layout";
 
 // Set by app/api/v1/auth_youtube.py's /callback redirect (?youtube_connect=...).
 const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {
@@ -12,6 +19,26 @@ const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {
   not_configured: "YouTube OAuth isn't configured (missing client id/secret in .env).",
   failed: "YouTube connection failed — please try again.",
 };
+
+const CARD = "rounded-2xl border border-slate-200 bg-white p-5 shadow-sm";
+const PRIMARY_BUTTON =
+  "w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700";
+const INPUT =
+  "rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent";
+
+function StatusRow({ label, status }: { label: string; status: StatusEntry["status"] }) {
+  return (
+    <li className="flex items-center gap-2 py-1.5 text-sm">
+      <span
+        className={`inline-block h-2.5 w-2.5 shrink-0 rounded-full ${STATUS_DOT_CLASSES[status]}`}
+        role="img"
+        aria-label={STATUS_LABELS[status]}
+      />
+      <span className="text-slate-700">{label}</span>
+      <span className="text-slate-400">— {STATUS_LABELS[status]}</span>
+    </li>
+  );
+}
 
 export function Settings() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
@@ -54,55 +81,83 @@ export function Settings() {
   }
 
   return (
-    <div className="settings">
-      <h1>Settings</h1>
+    <div className="flex flex-col gap-6">
+      <h1 className="text-2xl font-semibold text-slate-900">Settings</h1>
       <ConnectionHealthBanners authStatus={authStatus} />
 
-      <section>
-        <h2>Connection health</h2>
+      <section className={CARD}>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700">Connection health</h2>
         {authStatus && (
-          <ul>
-            <li>Write path (playlist edits): {authStatus.write_path.status}</li>
-            <li>Detection path (new likes): {authStatus.detection_path.status}</li>
-            <li>Last ingestion check: {authStatus.youtube_detection.status}</li>
-            <li>LLM BPM estimate: {authStatus.llm_bpm_estimate.status}</li>
-            <li>LLM description match: {authStatus.llm_description_match.status}</li>
-            <li>LLM playlist clustering: {authStatus.llm_clustering.status}</li>
-            <li>Last.fm genre lookup: {authStatus.lastfm.status}</li>
-            <li>GetSongBPM tempo lookup: {authStatus.getsongbpm.status}</li>
+          <ul className="divide-y divide-slate-100">
+            <StatusRow label="Write path (playlist edits)" status={authStatus.write_path.status} />
+            <StatusRow
+              label="Detection path (new likes)"
+              status={authStatus.detection_path.status}
+            />
+            <StatusRow label="Last ingestion check" status={authStatus.youtube_detection.status} />
+            <StatusRow label="LLM BPM estimate" status={authStatus.llm_bpm_estimate.status} />
+            <StatusRow
+              label="LLM description match"
+              status={authStatus.llm_description_match.status}
+            />
+            <StatusRow label="LLM playlist clustering" status={authStatus.llm_clustering.status} />
+            <StatusRow label="Last.fm genre lookup" status={authStatus.lastfm.status} />
+            <StatusRow label="GetSongBPM tempo lookup" status={authStatus.getsongbpm.status} />
           </ul>
         )}
         {/* Plain <a> (full-page navigation), not a fetch: Google's consent
             screen can only be reached by the browser actually navigating
             there, and the CSRF guard in app/main.py exempts GET anyway. */}
-        <a href="/api/v1/auth/youtube/authorize">Connect Google account (new-likes detection)</a>
+        <a href="/api/v1/auth/youtube/authorize" className={`mt-4 inline-block ${PRIMARY_BUTTON}`}>
+          Connect Google account (new-likes detection)
+        </a>
       </section>
 
-      <section>
-        <h2>Check for new songs</h2>
-        <button onClick={() => void handleCheckForNewSongs()}>Check now</button>
+      <section className={CARD}>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700">Check for new songs</h2>
+        <button
+          onClick={() => void handleCheckForNewSongs()}
+          className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200"
+        >
+          Check now
+        </button>
       </section>
 
-      <section>
-        <h2>Create a playlist by description</h2>
-        <form onSubmit={(event) => void handleCreatePlaylist(event)}>
-          <label>
+      <section className={CARD}>
+        <h2 className="mb-3 text-sm font-semibold text-slate-700">Create a playlist by description</h2>
+        <form onSubmit={(event) => void handleCreatePlaylist(event)} className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-sm text-slate-600">
             Name
-            <input value={name} onChange={(event) => setName(event.target.value)} required />
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+              className={INPUT}
+            />
           </label>
-          <label>
+          <label className="flex flex-col gap-1 text-sm text-slate-600">
             Description
             <textarea
               value={description}
               onChange={(event) => setDescription(event.target.value)}
               required
+              className={INPUT}
             />
           </label>
-          <button type="submit">Create</button>
+          <button type="submit" className={PRIMARY_BUTTON}>
+            Create
+          </button>
         </form>
       </section>
 
-      {message && <p role="status">{message}</p>}
+      {message && (
+        <p
+          role="status"
+          className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 shadow-sm"
+        >
+          {message}
+        </p>
+      )}
     </div>
   );
 }
