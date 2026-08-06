@@ -8,8 +8,7 @@ import {
   type StatusEntry,
 } from "../api/client";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
-import { STATUS_DOT_CLASSES, STATUS_LABELS } from "../components/Layout";
-import { CARD, INPUT, PRIMARY_BUTTON } from "../styles";
+import { CARD, INPUT, PRIMARY_BUTTON, STATUS_DOT_CLASSES, STATUS_LABELS } from "../styles";
 
 // Set by app/api/v1/auth_youtube.py's /callback redirect (?youtube_connect=...).
 const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {

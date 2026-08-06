@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 
 import { fetchAuthStatus, type AuthStatus, type StatusEntry } from "../api/client";
+import { STATUS_DOT_CLASSES, STATUS_LABELS } from "../styles";
 
 export type Page = "review" | "settings" | "onboarding";
 
@@ -9,20 +10,6 @@ const NAV_ITEMS: { page: Page; label: string }[] = [
   { page: "onboarding", label: "Onboarding" },
   { page: "settings", label: "Settings" },
 ];
-
-// KTD3: one status-color mapping app-wide -- shared with Settings.tsx's
-// connection-health rows so both surfaces can never drift apart.
-export const STATUS_DOT_CLASSES: Record<StatusEntry["status"], string> = {
-  ok: "bg-emerald-500",
-  degraded: "bg-amber-500",
-  needs_reconnect: "bg-rose-600",
-};
-
-export const STATUS_LABELS: Record<StatusEntry["status"], string> = {
-  ok: "ok",
-  degraded: "degraded",
-  needs_reconnect: "needs reconnect",
-};
 
 function StatusDot({ label, status }: { label: string; status: StatusEntry["status"] }) {
   const text = `${label}: ${STATUS_LABELS[status]}`;
@@ -51,7 +38,13 @@ export function Layout({
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
 
   useEffect(() => {
-    void fetchAuthStatus().then(setAuthStatus);
+    let cancelled = false;
+    void fetchAuthStatus().then((status) => {
+      if (!cancelled) setAuthStatus(status);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
