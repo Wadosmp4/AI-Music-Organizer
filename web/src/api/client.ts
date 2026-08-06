@@ -48,15 +48,26 @@ export interface PlaylistProposal {
   confidence: number;
 }
 
-export interface ExistingPlaylist {
+// A playlist this app already created (a prior onboarding run or the
+// create-by-description feature) — tracked locally with the id/description/
+// rule this app itself assigned.
+export interface AddedPlaylist {
   id: number;
   name: string;
   description: string | null;
   rule: Record<string, unknown> | null;
 }
 
+// A real YouTube Music playlist the user already had before using this tool
+// -- this app has never touched it, so all we know is what YouTube itself
+// reports (no local id/description/rule).
+export interface YouTubePlaylist {
+  playlist_id: string;
+  title: string;
+}
+
 // Matches the backend's CreatedPlaylistResponse (app/api/v1/onboarding.py) —
-// distinct from ExistingPlaylist because a freshly created playlist never
+// distinct from AddedPlaylist because a freshly created playlist never
 // carries a `rule` (only playlists with a structured hard-gate rule do, and
 // onboarding selection never sets one).
 export interface CreatedPlaylist {
@@ -67,7 +78,8 @@ export interface CreatedPlaylist {
 
 export interface OnboardingAnalysis {
   proposals: PlaylistProposal[];
-  existing_playlists: ExistingPlaylist[];
+  existing_playlists: YouTubePlaylist[];
+  added_playlists: AddedPlaylist[];
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -122,7 +134,7 @@ export function fetchAuthStatus(): Promise<AuthStatus> {
 export function createPlaylist(
   name: string,
   description: string,
-): Promise<{ playlist: ExistingPlaylist; review_queue_items_created: number }> {
+): Promise<{ playlist: AddedPlaylist; review_queue_items_created: number }> {
   return request("/playlists", {
     method: "POST",
     body: JSON.stringify({ name, description }),

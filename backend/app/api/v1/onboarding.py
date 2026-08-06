@@ -26,16 +26,22 @@ class PlaylistProposalResponse(BaseModel):
     confidence: float
 
 
-class ExistingPlaylistResponse(BaseModel):
+class AddedPlaylistResponse(BaseModel):
     id: int
     name: str
     description: Optional[str]
     rule: Optional[dict]
 
 
+class YouTubePlaylistResponse(BaseModel):
+    playlist_id: str
+    title: str
+
+
 class AnalysisResponse(BaseModel):
     proposals: list[PlaylistProposalResponse]
-    existing_playlists: list[ExistingPlaylistResponse]
+    existing_playlists: list[YouTubePlaylistResponse]
+    added_playlists: list[AddedPlaylistResponse]
 
 
 class AcceptedProposal(BaseModel):
@@ -69,7 +75,8 @@ def get_analysis(
     service: LibraryAnalysisService = Depends(get_library_analysis_service),
 ) -> AnalysisResponse:
     proposals = service.propose_new_playlists(user.id)
-    existing = service.list_existing_playlists(user.id)
+    added = service.list_added_playlists(user.id)
+    existing_on_youtube = service.list_existing_youtube_playlists(user.id)
     return AnalysisResponse(
         proposals=[
             PlaylistProposalResponse(
@@ -78,10 +85,12 @@ def get_analysis(
             for p in proposals
         ],
         existing_playlists=[
-            ExistingPlaylistResponse(
-                id=pl.id, name=pl.name, description=pl.description, rule=pl.rule
-            )
-            for pl in existing
+            YouTubePlaylistResponse(playlist_id=pl["playlistId"], title=pl["title"])
+            for pl in existing_on_youtube
+        ],
+        added_playlists=[
+            AddedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description, rule=pl.rule)
+            for pl in added
         ],
     )
 

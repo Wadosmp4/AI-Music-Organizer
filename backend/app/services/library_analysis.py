@@ -98,8 +98,28 @@ class LibraryAnalysisService:
         self.openrouter_api_key = openrouter_api_key
         self._circuit_breaker = CircuitBreaker()
 
-    def list_existing_playlists(self, user_id: int) -> list[Playlist]:
+    def list_added_playlists(self, user_id: int) -> list[Playlist]:
+        """Playlists this app has already created (a prior onboarding run or
+        the create-by-description feature) — distinct from playlists that
+        exist on YouTube Music but this app has never touched (see
+        `list_existing_youtube_playlists`)."""
         return self.playlist_repository.list_for_user(user_id)
+
+    def list_existing_youtube_playlists(self, user_id: int) -> list[dict]:
+        """Real YouTube Music playlists the user already had before using this
+        tool — i.e. every library playlist minus the ones this app already
+        created (tracked locally by `youtube_playlist_id`). A live external
+        call: on failure this degrades to an empty list (KTD18) rather than
+        blocking the rest of onboarding analysis, since the AI proposals and
+        already-added playlists are still useful without it.
+        """
+        added = self.playlist_repository.list_for_user(user_id)
+        tracked_ids = {p.youtube_playlist_id for p in added if p.youtube_playlist_id}
+        try:
+            youtube_playlists = self.music_client.get_library_playlists()
+        except Exception:
+            return []
+        return [p for p in youtube_playlists if p["playlistId"] not in tracked_ids]
 
     def propose_new_playlists(self, user_id: int) -> list[PlaylistProposal]:
         if not self.openrouter_api_key:

@@ -12,15 +12,17 @@ beforeEach(() => {
 });
 
 describe("Onboarding", () => {
-  it("renders existing playlists and suggested proposals once loaded", async () => {
+  it("renders existing YouTube playlists, already-added playlists, and suggested proposals once loaded", async () => {
     vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
       proposals: [{ name: "Chill Vibes", theme: "lofi", song_count: 12, confidence: 0.8 }],
-      existing_playlists: [{ id: 1, name: "Workout", description: null, rule: null }],
+      existing_playlists: [{ playlist_id: "yt-1", title: "Road Trip" }],
+      added_playlists: [{ id: 1, name: "Workout", description: null, rule: null }],
     });
 
     render(<Onboarding />);
 
-    await screen.findByText("Workout");
+    await screen.findByText("Road Trip");
+    expect(screen.getByText("Workout")).toBeInTheDocument();
     expect(screen.getByText("Chill Vibes")).toBeInTheDocument();
   });
 
@@ -36,6 +38,7 @@ describe("Onboarding", () => {
     vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
       proposals: [{ name: "Chill Vibes", theme: "lofi", song_count: 12, confidence: 0.8 }],
       existing_playlists: [],
+      added_playlists: [],
     });
 
     render(<Onboarding />);
@@ -54,6 +57,7 @@ describe("Onboarding", () => {
     vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
       proposals: [],
       existing_playlists: [],
+      added_playlists: [],
     });
 
     render(<Onboarding />);
@@ -72,6 +76,7 @@ describe("Onboarding", () => {
     vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
       proposals: [],
       existing_playlists: [],
+      added_playlists: [],
     });
     vi.mocked(client.submitOnboardingSelection).mockResolvedValue({ created_playlists: [] });
     const onComplete = vi.fn();

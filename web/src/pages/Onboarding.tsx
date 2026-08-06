@@ -3,8 +3,9 @@ import { useEffect, useState } from "react";
 import {
   fetchOnboardingAnalysis,
   submitOnboardingSelection,
-  type ExistingPlaylist,
+  type AddedPlaylist,
   type PlaylistProposal,
+  type YouTubePlaylist,
 } from "../api/client";
 import { CARD, INPUT, PRIMARY_BUTTON, SECONDARY_BUTTON } from "../styles";
 
@@ -13,7 +14,8 @@ import { CARD, INPUT, PRIMARY_BUTTON, SECONDARY_BUTTON } from "../styles";
 // does backlog classification (U4's backfill) run.
 export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   const [proposals, setProposals] = useState<PlaylistProposal[]>([]);
-  const [existingPlaylists, setExistingPlaylists] = useState<ExistingPlaylist[]>([]);
+  const [existingPlaylists, setExistingPlaylists] = useState<YouTubePlaylist[]>([]);
+  const [addedPlaylists, setAddedPlaylists] = useState<AddedPlaylist[]>([]);
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
   const [customName, setCustomName] = useState("");
   const [customDescription, setCustomDescription] = useState("");
@@ -30,6 +32,7 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
         if (cancelled) return;
         setProposals(analysis.proposals);
         setExistingPlaylists(analysis.existing_playlists);
+        setAddedPlaylists(analysis.added_playlists);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -88,9 +91,32 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
       {!loading && (
         <>
           <section className={CARD}>
-            <h2 className="mb-3 text-sm font-semibold text-slate-700">Your existing playlists</h2>
+            <h2 className="mb-3 text-sm font-semibold text-slate-700">
+              Your existing YouTube Music playlists
+            </h2>
+            {existingPlaylists.length === 0 && (
+              <p className="text-sm text-slate-500">
+                No other playlists found on your YouTube Music account.
+              </p>
+            )}
             <ul className="flex flex-col gap-1">
               {existingPlaylists.map((playlist) => (
+                <li key={playlist.playlist_id} className="text-sm text-slate-700">
+                  {playlist.title}
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          <section className={CARD}>
+            <h2 className="mb-3 text-sm font-semibold text-slate-700">Playlists already added</h2>
+            {addedPlaylists.length === 0 && (
+              <p className="text-sm text-slate-500">
+                No playlists created by this app yet.
+              </p>
+            )}
+            <ul className="flex flex-col gap-1">
+              {addedPlaylists.map((playlist) => (
                 <li key={playlist.id} className="text-sm text-slate-700">
                   {playlist.name}
                 </li>

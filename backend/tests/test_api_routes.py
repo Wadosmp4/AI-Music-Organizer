@@ -32,6 +32,7 @@ _CSRF_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 def fake_music_client() -> MagicMock:
     music_client = MagicMock(spec=MusicServiceClient)
     music_client.create_playlist.return_value = "yt-playlist-fake-id"
+    music_client.get_library_playlists.return_value = []
     return music_client
 
 
@@ -256,7 +257,7 @@ def test_ingestion_check_via_http_reports_no_new_songs(session, api_client, fake
 # ---------------------------------------------------------------------------
 
 
-def test_onboarding_analysis_via_http_lists_existing_playlists(session, api_client):
+def test_onboarding_analysis_via_http_lists_added_playlists(session, api_client):
     user = _seed_default_user(session)
     playlist = Playlist(user_id=user.id, name="Existing", description="already here")
     session.add(playlist)
@@ -267,8 +268,30 @@ def test_onboarding_analysis_via_http_lists_existing_playlists(session, api_clie
     assert response.status_code == 200
     body = response.json()
     assert body["proposals"] == []  # no openrouter_api_key configured in tests
-    assert len(body["existing_playlists"]) == 1
-    assert body["existing_playlists"][0]["name"] == "Existing"
+    assert len(body["added_playlists"]) == 1
+    assert body["added_playlists"][0]["name"] == "Existing"
+
+
+def test_onboarding_analysis_via_http_lists_youtube_playlists_not_yet_added(
+    session, api_client, fake_music_client
+):
+    user = _seed_default_user(session)
+    session.add(
+        Playlist(
+            user_id=user.id, name="Already Added", youtube_playlist_id="yt-already-added"
+        )
+    )
+    session.commit()
+    fake_music_client.get_library_playlists.return_value = [
+        {"playlistId": "yt-already-added", "title": "Already Added"},
+        {"playlistId": "yt-pre-existing", "title": "Road Trip"},
+    ]
+
+    response = api_client.get("/api/v1/onboarding/analysis")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["existing_playlists"] == [{"playlist_id": "yt-pre-existing", "title": "Road Trip"}]
 
 
 def test_onboarding_select_via_http_creates_playlist_via_music_client(

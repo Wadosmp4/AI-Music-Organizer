@@ -134,14 +134,14 @@ def test_cluster_batch_empty_choices_list_surfaces_degraded_health_instead_of_ra
     assert "clustering" in reason.lower()
 
 
-def test_existing_playlists_shown_for_context_but_not_modified(session):
+def test_added_playlists_shown_for_context_but_not_modified(session):
     user = _make_user(session)
     existing = PlaylistRepository(session).create(
         Playlist(user_id=user.id, name="My Playlist", description="already here", rule=None)
     )
     service = _service(session)
 
-    listed = service.list_existing_playlists(user.id)
+    listed = service.list_added_playlists(user.id)
 
     assert len(listed) == 1
     assert listed[0].id == existing.id
@@ -149,6 +149,38 @@ def test_existing_playlists_shown_for_context_but_not_modified(session):
     refreshed = PlaylistRepository(session).get(existing.id)
     assert refreshed.name == "My Playlist"
     assert refreshed.description == "already here"
+
+
+def test_existing_youtube_playlists_excludes_ones_already_added_by_this_app(session):
+    user = _make_user(session)
+    PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="App-Created",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-already-added",
+        )
+    )
+    music_client = _fake_music_client()
+    music_client.get_library_playlists.return_value = [
+        {"playlistId": "yt-already-added", "title": "App-Created"},
+        {"playlistId": "yt-pre-existing", "title": "Road Trip"},
+    ]
+    service = _service(session, music_client=music_client)
+
+    listed = service.list_existing_youtube_playlists(user.id)
+
+    assert listed == [{"playlistId": "yt-pre-existing", "title": "Road Trip"}]
+
+
+def test_existing_youtube_playlists_degrades_to_empty_list_on_failure(session):
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_library_playlists.side_effect = RuntimeError("needs reconnect")
+    service = _service(session, music_client=music_client)
+
+    assert service.list_existing_youtube_playlists(user.id) == []
 
 
 def test_selecting_a_proposed_candidate_creates_an_empty_playlist_with_no_songs(session):
