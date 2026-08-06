@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 
 import {
-  checkForNewSongs,
   createPlaylist,
   fetchAuthStatus,
   type AuthStatus,
@@ -74,15 +73,6 @@ export function Settings() {
     setDescription("");
   }
 
-  async function handleCheckForNewSongs() {
-    const result = await checkForNewSongs();
-    setMessage(
-      result.ran
-        ? `Check complete (${result.mode}): ${result.new_songs_found} new song(s), ${result.queue_items_created} added to review queue.`
-        : "Finish onboarding before checking for new songs.",
-    );
-  }
-
   return (
     <div className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold text-slate-900">Settings</h1>
@@ -114,16 +104,6 @@ export function Settings() {
         <a href="/api/v1/auth/youtube/authorize" className={`mt-4 inline-block ${PRIMARY_BUTTON}`}>
           Connect Google account (new-likes detection)
         </a>
-      </section>
-
-      <section className={CARD}>
-        <h2 className="mb-3 text-sm font-semibold text-slate-700">Check for new songs</h2>
-        <button
-          onClick={() => void handleCheckForNewSongs()}
-          className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200"
-        >
-          Check now
-        </button>
       </section>
 
       <section className={CARD}>

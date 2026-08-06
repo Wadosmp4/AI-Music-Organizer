@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   approveItem,
+  checkForNewSongs,
   fetchAuthStatus,
   fetchReviewQueue,
   moveItem,
@@ -51,34 +52,63 @@ function ConfidenceBadge({ confidence }: { confidence: number | null }) {
 
 const PILL_BUTTON = "rounded-full px-3 py-1 text-sm font-medium transition-colors";
 
+// The drag payload's mime type -- a plain string key, not a real media type,
+// but "text/plain" is the one type every browser reliably carries through a
+// same-page HTML5 drag/drop without extra permissions.
+const DRAG_MIME_TYPE = "text/plain";
+
+interface DragPayload {
+  id: number;
+  version: number;
+}
+
 export function ReviewQueue() {
   const [items, setItems] = useState<ReviewQueueItem[]>([]);
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [checking, setChecking] = useState(false);
+  const [checkMessage, setCheckMessage] = useState<string | null>(null);
+  const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
+  const mountedRef = useRef(true);
+
+  async function loadQueue() {
+    try {
+      const [queue, status] = await Promise.all([fetchReviewQueue(), fetchAuthStatus()]);
+      if (!mountedRef.current) return;
+      setItems(queue.filter((item) => item.status === "pending"));
+      setAuthStatus(status);
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (mountedRef.current) setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function load() {
-      try {
-        const [queue, status] = await Promise.all([fetchReviewQueue(), fetchAuthStatus()]);
-        if (cancelled) return;
-        setItems(queue.filter((item) => item.status === "pending"));
-        setAuthStatus(status);
-      } catch (err) {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    void load();
+    mountedRef.current = true;
+    void loadQueue();
     return () => {
-      cancelled = true;
+      mountedRef.current = false;
     };
   }, []);
+
+  async function handleCheckForNewSongs() {
+    setChecking(true);
+    try {
+      const result = await checkForNewSongs();
+      if (!mountedRef.current) return;
+      setCheckMessage(
+        result.ran
+          ? `Loaded ${result.new_songs_found} new song(s), ${result.queue_items_created} added to review queue.`
+          : "Finish onboarding before loading new songs.",
+      );
+      await loadQueue();
+    } finally {
+      if (mountedRef.current) setChecking(false);
+    }
+  }
 
   async function handleApprove(item: ReviewQueueItem) {
     await approveItem(item.id, item.version);
@@ -90,17 +120,45 @@ export function ReviewQueue() {
     setItems((prev) => prev.filter((i) => i.id !== item.id));
   }
 
-  async function handleMove(item: ReviewQueueItem, newPlaylistId: number) {
-    await moveItem(item.id, item.version, newPlaylistId);
-    setItems((prev) => prev.filter((i) => i.id !== item.id));
+  async function handleMove(id: number, version: number, newPlaylistId: number) {
+    await moveItem(id, version, newPlaylistId);
+    setItems((prev) => prev.filter((i) => i.id !== id));
+  }
+
+  function handleDropOnPlaylist(event: React.DragEvent, playlistId: number) {
+    event.preventDefault();
+    setDragOverPlaylistId(null);
+    const raw = event.dataTransfer.getData(DRAG_MIME_TYPE);
+    if (!raw) return;
+    const { id, version } = JSON.parse(raw) as DragPayload;
+    const dragged = items.find((item) => item.id === id);
+    if (!dragged || dragged.playlist_id === playlistId) return;
+    void handleMove(id, version, playlistId);
   }
 
   const groups = useMemo(() => groupByPlaylist(items), [items]);
 
   return (
     <div className="flex flex-col gap-4">
-      <h1 className="text-2xl font-semibold text-slate-900">Review Queue</h1>
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold text-slate-900">Review Queue</h1>
+        <button
+          onClick={() => void handleCheckForNewSongs()}
+          disabled={checking}
+          className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
+        >
+          {checking ? "Loading…" : "Load next 50 songs"}
+        </button>
+      </div>
       <ConnectionHealthBanners authStatus={authStatus} />
+      {checkMessage && (
+        <p
+          role="status"
+          className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 shadow-sm"
+        >
+          {checkMessage}
+        </p>
+      )}
       {error && (
         <p role="alert" className={ALERT_BANNER}>
           {error}
@@ -113,7 +171,25 @@ export function ReviewQueue() {
       {[...groups.entries()].map(([playlistId, groupItems]) => (
         <section
           key={playlistId ?? "unassigned"}
-          className="rounded-2xl border border-slate-200 bg-white shadow-sm"
+          onDragOver={(event) => {
+            if (playlistId === null) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+          }}
+          onDragEnter={() => {
+            if (playlistId !== null) setDragOverPlaylistId(playlistId);
+          }}
+          onDragLeave={() => {
+            if (playlistId !== null) setDragOverPlaylistId((prev) => (prev === playlistId ? null : prev));
+          }}
+          onDrop={(event) => {
+            if (playlistId !== null) handleDropOnPlaylist(event, playlistId);
+          }}
+          className={`rounded-2xl border bg-white shadow-sm transition-colors ${
+            dragOverPlaylistId === playlistId && playlistId !== null
+              ? "border-accent bg-indigo-50"
+              : "border-slate-200"
+          }`}
         >
           <h2 className="border-b border-slate-100 px-5 py-3 text-sm font-semibold text-slate-700">
             Playlist #{playlistId ?? "unassigned"}
@@ -123,7 +199,15 @@ export function ReviewQueue() {
               <li
                 key={item.id}
                 data-testid={`queue-item-${item.id}`}
-                className="flex flex-col gap-2 px-5 py-4"
+                draggable
+                onDragStart={(event) => {
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData(
+                    DRAG_MIME_TYPE,
+                    JSON.stringify({ id: item.id, version: item.version } satisfies DragPayload),
+                  );
+                }}
+                className="flex cursor-grab flex-col gap-2 px-5 py-4 active:cursor-grabbing"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -157,7 +241,7 @@ export function ReviewQueue() {
                   <button
                     onClick={() => {
                       const target = window.prompt("Move to playlist id:");
-                      if (target) void handleMove(item, Number(target));
+                      if (target) void handleMove(item.id, item.version, Number(target));
                     }}
                     className={`${PILL_BUTTON} bg-slate-100 text-slate-700 hover:bg-slate-200`}
                   >

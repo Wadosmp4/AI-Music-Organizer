@@ -69,29 +69,6 @@ describe("Settings", () => {
     expect(client.createPlaylist).toHaveBeenCalledWith("Road Trip", "songs for driving");
   });
 
-  it("runs a check-for-new-songs pass and shows the result message", async () => {
-    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-    vi.mocked(client.checkForNewSongs).mockResolvedValue({
-      ran: true,
-      mode: "steady_state",
-      new_songs_found: 2,
-      queue_items_created: 1,
-      backfill_complete: true,
-    });
-
-    render(<Settings />);
-    await screen.findByText("Write path (playlist edits)");
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Check now"));
-
-    await waitFor(() => {
-      expect(screen.getByRole("status")).toHaveTextContent(
-        "Check complete (steady_state): 2 new song(s), 1 added to review queue.",
-      );
-    });
-  });
-
   it("shows the youtube_connect success message once and strips the query param", async () => {
     window.history.replaceState(null, "", "/?youtube_connect=success");
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);

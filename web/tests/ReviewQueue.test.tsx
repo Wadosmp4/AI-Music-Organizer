@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,6 +6,19 @@ import * as client from "../src/api/client";
 import { ReviewQueue } from "../src/pages/ReviewQueue";
 
 vi.mock("../src/api/client");
+
+// jsdom's DataTransfer doesn't persist data between dispatched events, so
+// tests carry their own in-memory store matching the real setData/getData
+// contract the component relies on.
+function makeDataTransfer() {
+  const store = new Map<string, string>();
+  return {
+    setData: (type: string, value: string) => store.set(type, value),
+    getData: (type: string) => store.get(type) ?? "",
+    dropEffect: "move",
+    effectAllowed: "move",
+  } as unknown as DataTransfer;
+}
 
 const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
@@ -107,6 +120,80 @@ describe("ReviewQueue", () => {
     });
     expect(client.moveItem).toHaveBeenCalledWith(1, 1, 20);
     promptSpy.mockRestore();
+  });
+
+  it("moves a song to another playlist by dragging it onto that playlist's section", async () => {
+    const dragged = makeItem({ id: 1, playlist_id: 10 });
+    const other = makeItem({
+      id: 2,
+      library_item_id: 2,
+      playlist_id: 20,
+      title: "Other Song",
+    });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([dragged, other]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.moveItem).mockResolvedValue({ ...dragged, status: "moved", playlist_id: 20 });
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const dataTransfer = makeDataTransfer();
+    const draggedRow = screen.getByTestId("queue-item-1");
+    const targetSection = screen.getByTestId("queue-item-2").closest("section")!;
+
+    fireEvent.dragStart(draggedRow, { dataTransfer });
+    fireEvent.drop(targetSection, { dataTransfer });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
+    });
+    expect(client.moveItem).toHaveBeenCalledWith(1, 1, 20);
+  });
+
+  it("does not call moveItem when dropping a song onto its own playlist", async () => {
+    const item = makeItem({ id: 1, playlist_id: 10 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const dataTransfer = makeDataTransfer();
+    const row = screen.getByTestId("queue-item-1");
+    const section = row.closest("section")!;
+
+    fireEvent.dragStart(row, { dataTransfer });
+    fireEvent.drop(section, { dataTransfer });
+
+    expect(client.moveItem).not.toHaveBeenCalled();
+    expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
+  });
+
+  it("loads the next batch of songs and shows the result message", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.checkForNewSongs).mockResolvedValue({
+      ran: true,
+      mode: "steady_state",
+      new_songs_found: 2,
+      queue_items_created: 1,
+      backfill_complete: true,
+    });
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Load next 50 songs"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Loaded 2 new song(s), 1 added to review queue.",
+      );
+    });
+    // The queue reloads after checking, on top of the initial mount fetch.
+    expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
   });
 
   it("does not call moveItem when the move prompt is cancelled", async () => {
