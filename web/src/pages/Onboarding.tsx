@@ -6,14 +6,7 @@ import {
   type ExistingPlaylist,
   type PlaylistProposal,
 } from "../api/client";
-
-const CARD = "rounded-2xl border border-slate-200 bg-white p-5 shadow-sm";
-const PRIMARY_BUTTON =
-  "w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700";
-const SECONDARY_BUTTON =
-  "w-fit rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200";
-const INPUT =
-  "rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent";
+import { CARD, INPUT, PRIMARY_BUTTON, SECONDARY_BUTTON } from "../styles";
 
 // F5: the user picks which playlists exist FIRST (AI-proposed candidates and/
 // or their own custom description) — only after this selection completes
@@ -31,12 +24,19 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    let cancelled = false;
     void fetchOnboardingAnalysis()
       .then((analysis) => {
+        if (cancelled) return;
         setProposals(analysis.proposals);
         setExistingPlaylists(analysis.existing_playlists);
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   function toggleAccepted(name: string) {

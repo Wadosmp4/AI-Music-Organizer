@@ -9,6 +9,7 @@ import {
 } from "../api/client";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
 import { STATUS_DOT_CLASSES, STATUS_LABELS } from "../components/Layout";
+import { CARD, INPUT, PRIMARY_BUTTON } from "../styles";
 
 // Set by app/api/v1/auth_youtube.py's /callback redirect (?youtube_connect=...).
 const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {
@@ -19,12 +20,6 @@ const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {
   not_configured: "YouTube OAuth isn't configured (missing client id/secret in .env).",
   failed: "YouTube connection failed — please try again.",
 };
-
-const CARD = "rounded-2xl border border-slate-200 bg-white p-5 shadow-sm";
-const PRIMARY_BUTTON =
-  "w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700";
-const INPUT =
-  "rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent";
 
 function StatusRow({ label, status }: { label: string; status: StatusEntry["status"] }) {
   return (
@@ -47,7 +42,10 @@ export function Settings() {
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    void fetchAuthStatus().then(setAuthStatus);
+    let cancelled = false;
+    void fetchAuthStatus().then((status) => {
+      if (!cancelled) setAuthStatus(status);
+    });
 
     const params = new URLSearchParams(window.location.search);
     const connectResult = params.get("youtube_connect");
@@ -56,9 +54,15 @@ export function Settings() {
       // Drop the query param so a page refresh doesn't re-show the message.
       window.history.replaceState(null, "", window.location.pathname);
       if (connectResult === "success") {
-        void fetchAuthStatus().then(setAuthStatus);
+        void fetchAuthStatus().then((status) => {
+          if (!cancelled) setAuthStatus(status);
+        });
       }
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function handleCreatePlaylist(event: React.FormEvent) {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   approveItem,
@@ -11,6 +11,7 @@ import {
 } from "../api/client";
 import { BpmAttribution } from "../components/BpmAttribution";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
+import { ALERT_BANNER } from "../styles";
 
 function groupByPlaylist(items: ReviewQueueItem[]): Map<number | null, ReviewQueueItem[]> {
   const groups = new Map<number | null, ReviewQueueItem[]>();
@@ -56,20 +57,27 @@ export function ReviewQueue() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function load() {
-    try {
-      const [queue, status] = await Promise.all([fetchReviewQueue(), fetchAuthStatus()]);
-      setItems(queue.filter((item) => item.status === "pending"));
-      setAuthStatus(status);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
   useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const [queue, status] = await Promise.all([fetchReviewQueue(), fetchAuthStatus()]);
+        if (cancelled) return;
+        setItems(queue.filter((item) => item.status === "pending"));
+        setAuthStatus(status);
+      } catch (err) {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
     void load();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function handleApprove(item: ReviewQueueItem) {
@@ -87,14 +95,14 @@ export function ReviewQueue() {
     setItems((prev) => prev.filter((i) => i.id !== item.id));
   }
 
-  const groups = groupByPlaylist(items);
+  const groups = useMemo(() => groupByPlaylist(items), [items]);
 
   return (
     <div className="flex flex-col gap-4">
       <h1 className="text-2xl font-semibold text-slate-900">Review Queue</h1>
       <ConnectionHealthBanners authStatus={authStatus} />
       {error && (
-        <p role="alert" className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
+        <p role="alert" className={ALERT_BANNER}>
           {error}
         </p>
       )}

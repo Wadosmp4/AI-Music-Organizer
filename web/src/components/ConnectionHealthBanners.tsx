@@ -1,14 +1,11 @@
 import type { ReactNode } from "react";
 
 import type { AuthStatus } from "../api/client";
+import { ALERT_BANNER } from "../styles";
 
 function Banner({ testId, children }: { testId: string; children: ReactNode }) {
   return (
-    <div
-      role="alert"
-      data-testid={testId}
-      className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"
-    >
+    <div role="alert" data-testid={testId} className={ALERT_BANNER}>
       {children}
     </div>
   );
