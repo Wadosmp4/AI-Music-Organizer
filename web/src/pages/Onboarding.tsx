@@ -62,7 +62,10 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
       .map((p) => ({ name: p.name, theme: p.theme }));
     await submitOnboardingSelection(acceptedProposals, customAdditions);
     setDone(true);
-    onComplete?.();
+    // Calling onComplete() synchronously here batches with setDone(true) into
+    // one React update, so App.tsx switches pages before the "done" message
+    // below ever paints -- give it a moment on screen first.
+    setTimeout(() => onComplete?.(), 1500);
   }
 
   if (done) {

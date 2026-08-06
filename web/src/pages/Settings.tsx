@@ -42,6 +42,11 @@ export function Settings() {
 
   useEffect(() => {
     let cancelled = false;
+    // Single fetch, not one-per-branch: the backend's /callback route fully
+    // updates auth status before it redirects here, so this mount-time fetch
+    // already reflects a just-completed connect -- a second post-redirect
+    // fetch was redundant and could race this one, letting whichever
+    // response arrived first win over the freshest data.
     void fetchAuthStatus().then((status) => {
       if (!cancelled) setAuthStatus(status);
     });
@@ -52,11 +57,6 @@ export function Settings() {
       setMessage(YOUTUBE_CONNECT_MESSAGES[connectResult] ?? "YouTube connection attempt finished.");
       // Drop the query param so a page refresh doesn't re-show the message.
       window.history.replaceState(null, "", window.location.pathname);
-      if (connectResult === "success") {
-        void fetchAuthStatus().then((status) => {
-          if (!cancelled) setAuthStatus(status);
-        });
-      }
     }
 
     return () => {
