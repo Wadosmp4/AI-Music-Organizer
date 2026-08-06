@@ -1,17 +1,26 @@
-"""Server-side web OAuth against the official YouTube Data API v3 (KTD4).
+"""Sole `MusicServiceClient` implementation (KTD4, KTD25), backed entirely by
+the official YouTube Data API v3 -- both the detection path (listing liked
+songs) and the write path (creating playlists, adding items) go through this
+one server-side web OAuth credential.
 
-Replaces the legacy `run_local_server` browser-popup flow, which cannot
-work for a persistent backend or a remote mobile client. This class
-exposes an authorization URL to redirect the user to, and a
-`exchange_code_for_token` step for the callback to call — wiring the
-actual HTTP redirect/callback routes is an API-layer concern outside
-this integration client (see app/api/v1/auth_youtube.py).
+The write path used to go through `ytmusicapi` (first cookie auth, then an
+attempt to reuse this same OAuth token as a Bearer header). That reuse
+attempt was abandoned: `music.youtube.com`'s internal API rejects Bearer
+tokens from this OAuth client's type outright (HTTP 400, even for a plain
+read), which matches `ytmusicapi`'s own OAuth support only ever working with
+a Google-registered "TVs and Limited Input devices" client -- a client type
+that only supports the device-code grant, the exact flow already confirmed
+broken upstream (see the Stop Conditions in the product plan). The official
+Data API's `playlists`/`playlistItems` endpoints are fully supported for this
+OAuth client's type, so the write path now uses them directly instead.
 """
 
 import re
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Iterator, Optional
+
+from contextlib import contextmanager
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -20,13 +29,48 @@ from googleapiclient.discovery import build
 
 from app.core.config import get_settings
 from app.integrations.auth_status import AuthStatus, auth_status_store
-from app.integrations.base import Track
+from app.integrations.base import MusicServiceClient, PlaylistSummary, Track
 from app.integrations.http_client import CircuitBreaker, call_with_retry
 
-SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/youtube"]
+"""Full read-write scope, not `.readonly` -- this one credential now backs
+both the detection path and the write path. Anyone with an existing
+`.readonly`-scoped token on file must re-run the /authorize login flow once
+to grant the wider scope."""
 UNAVAILABLE_TITLES = {"Private video", "Deleted video"}
 MUSIC_CATEGORY_ID = "10"  # YouTube's official video category taxonomy
 _CHANNEL_TOPIC_SUFFIX = re.compile(r"\s*-\s*Topic$")
+_ARTIST_NOISE = re.compile(r"(?:[\s\-(]*(?:vevo|official))+\)?\s*$", re.IGNORECASE)
+
+
+def track_artist(track: Track) -> str:
+    artists = track.get("artists") or []
+    return artists[0]["name"] if artists else "Unknown Artist"
+
+
+def artist_bucket_key(track: Track) -> str:
+    """Normalized key for merging channel-name variants of the same artist
+    (e.g. "Twenty One Pilots" vs "twenty one pilots" vs "TwentyOnePilotsVEVO").
+
+    Real VEVO channel names are conventionally squashed with no spaces
+    (e.g. "KatyPerryVEVO"), so stripping the suffix alone isn't enough to
+    collide it with the spaced-out artist name — whitespace is removed
+    too, after the suffix strip, so both variants land on the same key.
+    """
+    stripped = _ARTIST_NOISE.sub("", track_artist(track)).strip().lower()
+    return re.sub(r"\s+", "", stripped)
+
+
+def _track_from_playlist_item(item: dict) -> Optional[Track]:
+    snippet = item["snippet"]
+    title = snippet.get("title", "")
+    video_id = snippet.get("resourceId", {}).get("videoId")
+    if not video_id or title in UNAVAILABLE_TITLES:
+        return None
+    artist = _CHANNEL_TOPIC_SUFFIX.sub(
+        "", snippet.get("videoOwnerChannelTitle") or "Unknown Artist"
+    )
+    return {"videoId": video_id, "title": title, "artists": [{"name": artist}]}
 
 
 class _PendingOAuthState:
@@ -60,7 +104,7 @@ class _PendingOAuthState:
 pending_oauth_state = _PendingOAuthState()
 
 
-class YouTubeDataApiClient:
+class YouTubeDataApiClient(MusicServiceClient):
     def __init__(self, token_file: Optional[str] = None):
         settings = get_settings()
         self.client_id = settings.yt_data_api_client_id
@@ -91,9 +135,12 @@ class YouTubeDataApiClient:
         flow = Flow.from_client_config(
             self._client_config(), scopes=SCOPES, redirect_uri=self.redirect_uri
         )
-        auth_url, state = flow.authorization_url(
-            access_type="offline", include_granted_scopes="true", prompt="consent"
-        )
+        # No include_granted_scopes: it makes Google bundle any previously
+        # granted scope (e.g. a stale .readonly grant from before SCOPES was
+        # widened) in with this request's scope, and oauthlib's strict
+        # scope-match check on token exchange then rejects the combined
+        # response because it doesn't equal exactly what we asked for.
+        auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
         return auth_url, state
 
     def exchange_code_for_token(self, code: str) -> None:
@@ -103,13 +150,21 @@ class YouTubeDataApiClient:
         flow.fetch_token(code=code)
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
         self.token_file.write_text(flow.credentials.to_json())
+        # Both paths share this one credential -- a fresh successful login
+        # clears both banners, not just detection's (KTD17: independently
+        # surfaced, but a shared root cause fixes both at once).
         auth_status_store.set_detection_status(AuthStatus.OK)
+        auth_status_store.set_write_status(AuthStatus.OK)
 
     def _load_credentials(self) -> Credentials:
+        """Loads and, if necessary, refreshes the stored OAuth credential.
+
+        Pure credential mechanics -- raises on missing/invalid/unrefreshable
+        tokens, with no opinion on which call path (detection vs write)
+        triggered the load. Callers go through `_status_tracking` so the
+        failure is attributed to the right health signal (KTD17).
+        """
         if not self.token_file.exists():
-            auth_status_store.set_detection_status(
-                AuthStatus.NEEDS_RECONNECT, "no token on file — connect an account"
-            )
             raise RuntimeError("YouTube Data API not connected — no token on file")
 
         creds = Credentials.from_authorized_user_file(str(self.token_file), SCOPES)
@@ -120,56 +175,69 @@ class YouTubeDataApiClient:
             try:
                 creds.refresh(Request())
             except Exception as exc:
-                # Refresh itself failing means the token was revoked, not just expired —
+                # Refresh itself failing means the token was revoked, not just expired --
                 # this gets its own manual-reconnect affordance (KTD17); refresh alone can't recover it.
-                auth_status_store.set_detection_status(
-                    AuthStatus.NEEDS_RECONNECT, f"token revoked, refresh failed: {exc}"
-                )
-                raise
+                raise RuntimeError(f"token revoked, refresh failed: {exc}") from exc
             self.token_file.write_text(creds.to_json())
-            auth_status_store.set_detection_status(AuthStatus.OK)
             return creds
 
-        auth_status_store.set_detection_status(
-            AuthStatus.NEEDS_RECONNECT, "token invalid and not refreshable"
-        )
         raise RuntimeError("YouTube Data API token invalid and not refreshable")
 
-    def get_liked_songs(self) -> list[Track]:
-        creds = self._load_credentials()
-        youtube = build("youtube", "v3", credentials=creds)
+    @contextmanager
+    def _status_tracking(self, status_setter):
+        """Runs a block against the shared OAuth credential, translating its
+        outcome into the given health-status setter (KTD17): NEEDS_RECONNECT
+        with the failure reason on any exception, OK otherwise. Which setter
+        (`set_detection_status` vs `set_write_status`) is picked by the
+        caller, since that's the only thing that distinguishes the two call
+        paths now that they share one credential.
+        """
+        try:
+            yield
+        except Exception as exc:
+            status_setter(AuthStatus.NEEDS_RECONNECT, str(exc))
+            raise
+        else:
+            status_setter(AuthStatus.OK)
 
-        channel = call_with_retry(
-            lambda: youtube.channels().list(part="contentDetails", mine=True).execute(),
-            circuit_breaker=self._circuit_breaker,
-        )
-        liked_playlist_id = channel["items"][0]["contentDetails"]["relatedPlaylists"]["likes"]
+    def _paginate_items(self, request_fn) -> Iterator[dict]:
+        """Yields every `items` entry across all pages of a List call.
 
-        tracks: list[Track] = []
+        request_fn(page_token) -> executed API response dict.
+        """
         page_token = None
         while True:
             resp = call_with_retry(
-                lambda pt=page_token: youtube.playlistItems()
-                .list(playlistId=liked_playlist_id, part="snippet", maxResults=50, pageToken=pt)
-                .execute(),
-                circuit_breaker=self._circuit_breaker,
+                lambda pt=page_token: request_fn(pt), circuit_breaker=self._circuit_breaker
             )
-            for item in resp.get("items", []):
-                snippet = item["snippet"]
-                title = snippet.get("title", "")
-                video_id = snippet.get("resourceId", {}).get("videoId")
-                if not video_id or title in UNAVAILABLE_TITLES:
-                    continue
-                artist = _CHANNEL_TOPIC_SUFFIX.sub(
-                    "", snippet.get("videoOwnerChannelTitle") or "Unknown Artist"
-                )
-                tracks.append({"videoId": video_id, "title": title, "artists": [{"name": artist}]})
+            yield from resp.get("items", [])
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
 
-        music_ids = self._music_video_ids(youtube, [t["videoId"] for t in tracks])
-        return [t for t in tracks if t["videoId"] in music_ids]
+    def get_liked_songs(self) -> list[Track]:
+        with self._status_tracking(auth_status_store.set_detection_status):
+            creds = self._load_credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+
+            channel = call_with_retry(
+                lambda: youtube.channels().list(part="contentDetails", mine=True).execute(),
+                circuit_breaker=self._circuit_breaker,
+            )
+            liked_playlist_id = channel["items"][0]["contentDetails"]["relatedPlaylists"]["likes"]
+
+            tracks = [
+                track
+                for item in self._paginate_items(
+                    lambda pt: youtube.playlistItems()
+                    .list(playlistId=liked_playlist_id, part="snippet", maxResults=50, pageToken=pt)
+                    .execute()
+                )
+                if (track := _track_from_playlist_item(item)) is not None
+            ]
+
+            music_ids = self._music_video_ids(youtube, [t["videoId"] for t in tracks])
+            return [t for t in tracks if t["videoId"] in music_ids]
 
     def _music_video_ids(self, youtube, video_ids: list[str]) -> set[str]:
         """Liked videos include regular (non-music) YouTube likes; keep only official Music category."""
@@ -184,3 +252,65 @@ class YouTubeDataApiClient:
                 if item["snippet"].get("categoryId") == MUSIC_CATEGORY_ID:
                     music_ids.add(item["id"])
         return music_ids
+
+    def get_library_playlists(self) -> list[PlaylistSummary]:
+        with self._status_tracking(auth_status_store.set_write_status):
+            creds = self._load_credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+            items = self._paginate_items(
+                lambda pt: youtube.playlists()
+                .list(part="snippet", mine=True, maxResults=50, pageToken=pt)
+                .execute()
+            )
+            return [
+                {"playlistId": item["id"], "title": item["snippet"]["title"]} for item in items
+            ]
+
+    def get_playlist_tracks(self, playlist_id: str) -> list[Track]:
+        with self._status_tracking(auth_status_store.set_write_status):
+            creds = self._load_credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+            items = self._paginate_items(
+                lambda pt: youtube.playlistItems()
+                .list(playlistId=playlist_id, part="snippet", maxResults=50, pageToken=pt)
+                .execute()
+            )
+            return [t for item in items if (t := _track_from_playlist_item(item)) is not None]
+
+    def create_playlist(self, name: str, description: str) -> str:
+        with self._status_tracking(auth_status_store.set_write_status):
+            creds = self._load_credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+            response = call_with_retry(
+                lambda: youtube.playlists()
+                .insert(
+                    part="snippet,status",
+                    body={
+                        "snippet": {"title": name, "description": description},
+                        "status": {"privacyStatus": "private"},
+                    },
+                )
+                .execute(),
+                circuit_breaker=self._circuit_breaker,
+            )
+            return response["id"]
+
+    def add_playlist_items(self, playlist_id: str, video_ids: list[str]) -> None:
+        with self._status_tracking(auth_status_store.set_write_status):
+            creds = self._load_credentials()
+            youtube = build("youtube", "v3", credentials=creds)
+            for video_id in video_ids:
+                call_with_retry(
+                    lambda vid=video_id: youtube.playlistItems()
+                    .insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "playlistId": playlist_id,
+                                "resourceId": {"kind": "youtube#video", "videoId": vid},
+                            }
+                        },
+                    )
+                    .execute(),
+                    circuit_breaker=self._circuit_breaker,
+                )

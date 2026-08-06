@@ -28,9 +28,10 @@ class MusicServiceClient(ABC):
     """Data-source-agnostic boundary (R1, KTD25).
 
     Classification and review-queue logic depend on this interface only,
-    never on a specific music service's SDK. `ytmusic_client.py` is the
-    sole implementation today; a second service means a new adapter here,
-    not a change to any business logic that consumes it.
+    never on a specific music service's SDK. `youtube_data_api_client.py`'s
+    `YouTubeDataApiClient` is the sole implementation today; a second service
+    means a new adapter here, not a change to any business logic that
+    consumes it.
     """
 
     @abstractmethod

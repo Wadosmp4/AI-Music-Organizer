@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
-from app.integrations.ytmusic_client import track_artist
+from app.integrations.youtube_data_api_client import track_artist
 from app.models.library import LibraryItem
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository

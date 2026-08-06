@@ -13,7 +13,7 @@ from sqlmodel import Session
 from app.core.config import get_settings
 from app.core.db import get_session
 from app.integrations.base import MusicServiceClient
-from app.integrations.ytmusic_client import YTMusicClient
+from app.integrations.youtube_data_api_client import YouTubeDataApiClient
 from app.models.user import User
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
@@ -44,7 +44,7 @@ def get_default_user(session: Session = Depends(get_session)) -> User:
 
 
 def get_music_client() -> MusicServiceClient:
-    return YTMusicClient()
+    return YouTubeDataApiClient()
 
 
 def get_library_repository(session: Session = Depends(get_session)) -> LibraryRepository:

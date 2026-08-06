@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from app.integrations.base import Track
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.integrations.http_client import CircuitBreaker, call_with_retry
-from app.integrations.ytmusic_client import artist_bucket_key, track_artist
+from app.integrations.youtube_data_api_client import artist_bucket_key, track_artist
 from app.models.playlist import Playlist
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.services.bpm_lookup import BpmLookupService

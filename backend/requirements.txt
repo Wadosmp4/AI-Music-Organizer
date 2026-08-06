@@ -5,8 +5,7 @@ alembic==1.14.0
 pydantic-settings==2.7.1
 python-dotenv==1.0.1
 
-# YouTube integrations (U2)
-ytmusicapi==1.10.2
+# YouTube integrations (U2) -- official Data API v3 only (KTD4)
 google-api-python-client==2.157.0
 google-auth-oauthlib==1.2.1
 # Pinned explicitly: cryptography>=44 (a transitive dep of google-auth's

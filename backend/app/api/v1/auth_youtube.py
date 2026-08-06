@@ -11,10 +11,14 @@ youtube_data_api_client.py for why an in-memory slot is sufficient for this
 personal single-user tool).
 """
 
+import logging
+
 from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
 from app.integrations.youtube_data_api_client import YouTubeDataApiClient, pending_oauth_state
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth/youtube", tags=["auth"])
 
@@ -46,5 +50,6 @@ def callback(code: str | None = None, state: str | None = None, error: str | Non
     try:
         YouTubeDataApiClient().exchange_code_for_token(code)
     except Exception:
+        logger.exception("YouTube OAuth code exchange failed")
         return RedirectResponse(f"{_FRONTEND_URL}?youtube_connect=failed")
     return RedirectResponse(f"{_FRONTEND_URL}?youtube_connect=success")

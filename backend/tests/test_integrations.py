@@ -4,8 +4,7 @@ import pytest
 
 from app.integrations.auth_status import AuthStatus, auth_status_store
 from app.integrations.http_client import CircuitBreaker
-from app.integrations.youtube_data_api_client import YouTubeDataApiClient
-from app.integrations.ytmusic_client import YTMusicClient, artist_bucket_key
+from app.integrations.youtube_data_api_client import YouTubeDataApiClient, artist_bucket_key
 
 
 @pytest.fixture(autouse=True)
@@ -17,23 +16,138 @@ def reset_auth_status():
     auth_status_store.set_detection_status(AuthStatus.OK)
 
 
-def test_cookie_auth_failure_flips_write_path_to_needs_reconnect(tmp_path):
-    auth_file = tmp_path / "browser.json"
-    auth_file.write_text("{}")
+def _client_with_valid_creds(tmp_path) -> YouTubeDataApiClient:
+    token_file = tmp_path / "token.json"
+    token_file.write_text("{}")
+    client = YouTubeDataApiClient(token_file=str(token_file))
+    client._load_credentials = MagicMock(return_value=MagicMock())
+    return client
 
-    with patch("app.integrations.ytmusic_client.YTMusic") as mock_ytmusic_cls:
-        mock_yt = MagicMock()
-        mock_yt.get_library_playlists.side_effect = RuntimeError("signed out")
-        mock_ytmusic_cls.return_value = mock_yt
 
-        client = YTMusicClient(auth_file=str(auth_file), data_api_client=MagicMock())
+def test_create_playlist_calls_data_api_and_returns_id(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlists.return_value.insert.return_value.execute.return_value = {
+            "id": "PL123"
+        }
+        mock_build.return_value = mock_youtube
+
+        playlist_id = client.create_playlist("Road Trip", "songs for driving")
+
+    assert playlist_id == "PL123"
+    _, kwargs = mock_youtube.playlists.return_value.insert.call_args
+    assert kwargs["body"]["snippet"]["title"] == "Road Trip"
+    assert kwargs["body"]["snippet"]["description"] == "songs for driving"
+    status, _ = auth_status_store.get_write_status()
+    assert status == AuthStatus.OK
+
+
+def test_create_playlist_failure_flips_write_path_to_needs_reconnect(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlists.return_value.insert.return_value.execute.side_effect = RuntimeError(
+            "quota exceeded"
+        )
+        mock_build.return_value = mock_youtube
 
         with pytest.raises(RuntimeError):
-            client.get_library_playlists()
+            client.create_playlist("Road Trip", "")
 
     status, reason = auth_status_store.get_write_status()
     assert status == AuthStatus.NEEDS_RECONNECT
-    assert "signed out" in reason
+    assert "quota exceeded" in reason
+
+
+def test_add_playlist_items_inserts_each_video(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlistItems.return_value.insert.return_value.execute.return_value = {}
+        mock_build.return_value = mock_youtube
+
+        client.add_playlist_items("PL123", ["v1", "v2"])
+
+    inserted_video_ids = [
+        call.kwargs["body"]["snippet"]["resourceId"]["videoId"]
+        for call in mock_youtube.playlistItems.return_value.insert.call_args_list
+    ]
+    assert inserted_video_ids == ["v1", "v2"]
+
+
+def test_missing_oauth_token_flips_write_path_to_needs_reconnect(tmp_path):
+    client = YouTubeDataApiClient(token_file=str(tmp_path / "missing.json"))
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        with pytest.raises(RuntimeError):
+            client.create_playlist("Road Trip", "")
+
+    mock_build.assert_not_called()
+    status, reason = auth_status_store.get_write_status()
+    assert status == AuthStatus.NEEDS_RECONNECT
+    assert "no token on file" in reason
+
+
+def test_get_library_playlists_maps_data_api_response(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlists.return_value.list.return_value.execute.return_value = {
+            "items": [{"id": "PL1", "snippet": {"title": "Gym"}}],
+        }
+        mock_build.return_value = mock_youtube
+
+        playlists = client.get_library_playlists()
+
+    assert playlists == [{"playlistId": "PL1", "title": "Gym"}]
+
+
+def test_get_playlist_tracks_skips_unavailable_videos(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlistItems.return_value.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "snippet": {
+                        "title": "Real Song",
+                        "resourceId": {"videoId": "v1"},
+                        "videoOwnerChannelTitle": "Some Artist - Topic",
+                    }
+                },
+                {"snippet": {"title": "Private video", "resourceId": {"videoId": "v2"}}},
+            ]
+        }
+        mock_build.return_value = mock_youtube
+
+        tracks = client.get_playlist_tracks("PL123")
+
+    assert tracks == [{"videoId": "v1", "title": "Real Song", "artists": [{"name": "Some Artist"}]}]
+
+
+def test_exchange_code_for_token_clears_both_health_signals(tmp_path):
+    auth_status_store.set_detection_status(AuthStatus.NEEDS_RECONNECT, "stale")
+    auth_status_store.set_write_status(AuthStatus.NEEDS_RECONNECT, "stale")
+
+    client = YouTubeDataApiClient(token_file=str(tmp_path / "token.json"))
+    mock_flow = MagicMock()
+    mock_flow.credentials.to_json.return_value = "{}"
+
+    with patch(
+        "app.integrations.youtube_data_api_client.Flow.from_client_config", return_value=mock_flow
+    ):
+        client.exchange_code_for_token("some-code")
+
+    detection_status, _ = auth_status_store.get_detection_status()
+    write_status, _ = auth_status_store.get_write_status()
+    assert detection_status == AuthStatus.OK
+    assert write_status == AuthStatus.OK
 
 
 def test_oauth_token_expiry_triggers_refresh(tmp_path):
@@ -59,8 +173,6 @@ def test_oauth_token_expiry_triggers_refresh(tmp_path):
 
     mock_creds.refresh.assert_called_once()
     assert result is mock_creds
-    status, _ = auth_status_store.get_detection_status()
-    assert status == AuthStatus.OK
 
 
 def test_oauth_token_revocation_flips_detection_path_only(tmp_path):
@@ -77,7 +189,8 @@ def test_oauth_token_revocation_flips_detection_path_only(tmp_path):
         return_value=mock_creds,
     ):
         with pytest.raises(RuntimeError):
-            client._load_credentials()
+            with client._status_tracking(auth_status_store.set_detection_status):
+                client._load_credentials()
 
     detection_status, detection_reason = auth_status_store.get_detection_status()
     write_status, _ = auth_status_store.get_write_status()
