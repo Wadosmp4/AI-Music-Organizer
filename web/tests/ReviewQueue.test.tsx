@@ -63,23 +63,49 @@ describe("ReviewQueue", () => {
     expect(listItem).toHaveTextContent("TK from Ling Tosite Sigure");
   });
 
-  it("removes an item from the visible queue after approving it", async () => {
-    const item = makeItem();
-    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+  it("approves every song in a playlist group when Approve all is clicked", async () => {
+    const first = makeItem({ id: 1, playlist_id: 10, version: 1 });
+    const second = makeItem({ id: 2, library_item_id: 2, playlist_id: 10, version: 3 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([first, second]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-    vi.mocked(client.approveItem).mockResolvedValue({ ...item, status: "approved" });
+    vi.mocked(client.approveItem).mockResolvedValue({ ...first, status: "approved" });
 
     render(<ReviewQueue />);
-
     await screen.findByTestId("queue-item-1");
 
     const user = userEvent.setup();
-    await user.click(screen.getByText("Approve"));
+    await user.click(screen.getByText("Approve all (2)"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("queue-item-2")).not.toBeInTheDocument();
+    });
+    expect(client.approveItem).toHaveBeenCalledWith(1, 1);
+    expect(client.approveItem).toHaveBeenCalledWith(2, 3);
+  });
+
+  it("keeps songs that failed to approve visible after a partial Approve all failure", async () => {
+    const succeeds = makeItem({ id: 1, playlist_id: 10, version: 1 });
+    const fails = makeItem({ id: 2, library_item_id: 2, playlist_id: 10, version: 1 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([succeeds, fails]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.approveItem).mockImplementation((id) =>
+      id === 1
+        ? Promise.resolve({ ...succeeds, status: "approved" })
+        : Promise.reject(new Error("network error")),
+    );
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Approve all (2)"));
 
     await waitFor(() => {
       expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
     });
-    expect(client.approveItem).toHaveBeenCalledWith(1, 1);
+    expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("1 of 2 song(s) failed to approve");
   });
 
   it("removes an item from the visible queue after rejecting it", async () => {
@@ -99,27 +125,6 @@ describe("ReviewQueue", () => {
       expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
     });
     expect(client.rejectItem).toHaveBeenCalledWith(1, 1);
-  });
-
-  it("removes an item from the visible queue after moving it to a prompted playlist id", async () => {
-    const item = makeItem();
-    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
-    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-    vi.mocked(client.moveItem).mockResolvedValue({ ...item, status: "moved", playlist_id: 20 });
-    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("20");
-
-    render(<ReviewQueue />);
-
-    await screen.findByTestId("queue-item-1");
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Move"));
-
-    await waitFor(() => {
-      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
-    });
-    expect(client.moveItem).toHaveBeenCalledWith(1, 1, 20);
-    promptSpy.mockRestore();
   });
 
   it("moves a song to another playlist by dragging it onto that playlist's section", async () => {
@@ -194,24 +199,6 @@ describe("ReviewQueue", () => {
     });
     // The queue reloads after checking, on top of the initial mount fetch.
     expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not call moveItem when the move prompt is cancelled", async () => {
-    const item = makeItem();
-    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
-    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue(null);
-
-    render(<ReviewQueue />);
-
-    await screen.findByTestId("queue-item-1");
-
-    const user = userEvent.setup();
-    await user.click(screen.getByText("Move"));
-
-    expect(client.moveItem).not.toHaveBeenCalled();
-    expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
-    promptSpy.mockRestore();
   });
 
   it("shows only the write-path banner when just the write path is degraded", async () => {

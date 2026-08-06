@@ -110,9 +110,20 @@ export function ReviewQueue() {
     }
   }
 
-  async function handleApprove(item: ReviewQueueItem) {
-    await approveItem(item.id, item.version);
-    setItems((prev) => prev.filter((i) => i.id !== item.id));
+  async function handleApproveAll(groupItems: ReviewQueueItem[]) {
+    const results = await Promise.allSettled(
+      groupItems.map((item) => approveItem(item.id, item.version)),
+    );
+    const succeededIds = new Set(
+      groupItems.filter((_, i) => results[i].status === "fulfilled").map((item) => item.id),
+    );
+    setItems((prev) => prev.filter((i) => !succeededIds.has(i.id)));
+    const failedCount = results.length - succeededIds.size;
+    if (failedCount > 0) {
+      setError(
+        `${failedCount} of ${groupItems.length} song(s) failed to approve — the rest were approved; click Approve all again to retry the remainder.`,
+      );
+    }
   }
 
   async function handleReject(item: ReviewQueueItem) {
@@ -191,9 +202,19 @@ export function ReviewQueue() {
               : "border-slate-200"
           }`}
         >
-          <h2 className="border-b border-slate-100 px-5 py-3 text-sm font-semibold text-slate-700">
-            Playlist #{playlistId ?? "unassigned"}
-          </h2>
+          <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
+            <h2 className="text-sm font-semibold text-slate-700">
+              Playlist #{playlistId ?? "unassigned"}
+            </h2>
+            {playlistId !== null && (
+              <button
+                onClick={() => void handleApproveAll(groupItems)}
+                className={`${PILL_BUTTON} bg-emerald-100 text-emerald-700 hover:bg-emerald-200`}
+              >
+                Approve all ({groupItems.length})
+              </button>
+            )}
+          </div>
           <ul className="divide-y divide-slate-100">
             {groupItems.map((item) => (
               <li
@@ -227,25 +248,10 @@ export function ReviewQueue() {
                 {item.explanation?.bpm_source === "measured" && <BpmAttribution />}
                 <div className="flex gap-2 pt-1">
                   <button
-                    onClick={() => void handleApprove(item)}
-                    className={`${PILL_BUTTON} bg-emerald-100 text-emerald-700 hover:bg-emerald-200`}
-                  >
-                    Approve
-                  </button>
-                  <button
                     onClick={() => void handleReject(item)}
                     className={`${PILL_BUTTON} bg-rose-100 text-rose-700 hover:bg-rose-200`}
                   >
                     Reject
-                  </button>
-                  <button
-                    onClick={() => {
-                      const target = window.prompt("Move to playlist id:");
-                      if (target) void handleMove(item.id, item.version, Number(target));
-                    }}
-                    className={`${PILL_BUTTON} bg-slate-100 text-slate-700 hover:bg-slate-200`}
-                  >
-                    Move
                   </button>
                 </div>
               </li>
