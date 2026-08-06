@@ -20,6 +20,7 @@ from app.models.library import LibraryItem
 from app.models.playlist import Playlist
 from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
+from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.user_repository import UserRepository
 
 # The backend's CSRF guard (app/main.py) requires this on every mutating
@@ -273,6 +274,30 @@ def test_ingestion_check_via_http_reports_no_new_songs(session, api_client, fake
     assert body["new_songs_found"] == 0
 
 
+def test_ingestion_reset_via_http_clears_uncommitted_songs_and_reopens_backfill(
+    session, api_client
+):
+    user = _seed_default_user(session)
+    UserRepository(session).mark_onboarding_completed(user.id)
+    UserRepository(session).mark_backfill_completed(user.id)
+    library_item = LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    session.add(library_item)
+    session.commit()
+    session.refresh(library_item)
+    session.add(
+        ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=None)
+    )
+    session.commit()
+
+    response = api_client.post("/api/v1/ingestion/reset", headers=_CSRF_HEADERS)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["library_items_cleared"] == 1
+    fresh_user = UserRepository(session).get(user.id)
+    assert fresh_user.backfill_completed_at is None
+
+
 # ---------------------------------------------------------------------------
 # onboarding router
 # ---------------------------------------------------------------------------
@@ -336,6 +361,55 @@ def test_onboarding_select_via_http_creates_playlist_via_music_client(
     # #19: the response must not claim a `rule` field the backend never sends.
     assert "rule" not in body["created_playlists"][0]
     fake_music_client.create_playlist.assert_called_once_with("Chill Electronic", "Laid-back")
+
+
+def test_onboarding_select_via_http_adopts_an_existing_youtube_playlist_without_recreating_it(
+    session, api_client, fake_music_client
+):
+    user = _seed_default_user(session)
+
+    response = api_client.post(
+        "/api/v1/onboarding/select",
+        json={
+            "accepted_proposals": [],
+            "custom_playlists": [],
+            "adopted_playlists": [{"playlist_id": "yt-pre-existing", "name": "Road Trip"}],
+        },
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["created_playlists"]) == 1
+    assert body["created_playlists"][0]["name"] == "Road Trip"
+    fake_music_client.create_playlist.assert_not_called()
+    adopted = PlaylistRepository(session).list_for_user(user.id)
+    assert any(p.youtube_playlist_id == "yt-pre-existing" for p in adopted)
+
+
+def test_onboarding_select_via_http_removes_an_unchecked_already_added_playlist(
+    session, api_client, fake_music_client
+):
+    user = _seed_default_user(session)
+    playlist = Playlist(
+        user_id=user.id, name="Workout", youtube_playlist_id="yt-workout"
+    )
+    session.add(playlist)
+    session.commit()
+    session.refresh(playlist)
+
+    response = api_client.post(
+        "/api/v1/onboarding/select",
+        json={
+            "accepted_proposals": [],
+            "custom_playlists": [],
+            "removed_playlist_ids": [playlist.id],
+        },
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert PlaylistRepository(session).list_for_user(user.id) == []
 
 
 # ---------------------------------------------------------------------------

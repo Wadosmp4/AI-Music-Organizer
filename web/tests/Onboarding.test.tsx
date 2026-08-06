@@ -53,6 +53,57 @@ describe("Onboarding", () => {
     expect(checkbox).toBeChecked();
   });
 
+  it("toggles an existing YouTube playlist's adopted state and submits it on finish", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [{ playlist_id: "yt-1", title: "Road Trip" }],
+      added_playlists: [],
+    });
+    vi.mocked(client.submitOnboardingSelection).mockResolvedValue({ created_playlists: [] });
+
+    render(<Onboarding />);
+    await screen.findByText("Road Trip");
+
+    const checkbox = screen.getByRole("checkbox");
+    expect(checkbox).not.toBeChecked();
+
+    const user = userEvent.setup();
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
+
+    await user.click(screen.getByText("Finish setup"));
+
+    expect(client.submitOnboardingSelection).toHaveBeenCalledWith(
+      [],
+      [],
+      [{ playlist_id: "yt-1", name: "Road Trip" }],
+      [],
+    );
+  });
+
+  it("starts an already-added playlist checked, and submits its removal when unchecked", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [],
+      added_playlists: [{ id: 7, name: "Workout", description: null, rule: null }],
+    });
+    vi.mocked(client.submitOnboardingSelection).mockResolvedValue({ created_playlists: [] });
+
+    render(<Onboarding />);
+    await screen.findByText("Workout");
+
+    const checkbox = screen.getByRole("checkbox");
+    expect(checkbox).toBeChecked();
+
+    const user = userEvent.setup();
+    await user.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+
+    await user.click(screen.getByText("Finish setup"));
+
+    expect(client.submitOnboardingSelection).toHaveBeenCalledWith([], [], [], [7]);
+  });
+
   it("adds a custom playlist as a chip and clears the form", async () => {
     vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
       proposals: [],

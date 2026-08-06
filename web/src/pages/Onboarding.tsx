@@ -17,6 +17,13 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   const [existingPlaylists, setExistingPlaylists] = useState<YouTubePlaylist[]>([]);
   const [addedPlaylists, setAddedPlaylists] = useState<AddedPlaylist[]>([]);
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
+  // Every playlist this app knows about (already-added or still just sitting
+  // on YouTube) gets one checkbox, keyed by `added:<id>` / `existing:<playlist_id>`
+  // -- checked means "this app manages it." Already-added ones start checked
+  // (unchecking removes them from local tracking); existing ones start
+  // unchecked (checking adopts them). See handleFinish for how each key maps
+  // back to an adopt/remove request.
+  const [checkedPlaylistKeys, setCheckedPlaylistKeys] = useState<Set<string>>(new Set());
   const [customName, setCustomName] = useState("");
   const [customDescription, setCustomDescription] = useState("");
   const [customAdditions, setCustomAdditions] = useState<{ name: string; description: string }[]>(
@@ -33,6 +40,9 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
         setProposals(analysis.proposals);
         setExistingPlaylists(analysis.existing_playlists);
         setAddedPlaylists(analysis.added_playlists);
+        setCheckedPlaylistKeys(
+          new Set(analysis.added_playlists.map((p) => `added:${p.id}`)),
+        );
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -51,6 +61,15 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     });
   }
 
+  function togglePlaylistKey(key: string) {
+    setCheckedPlaylistKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
   function addCustomPlaylist(event: React.FormEvent) {
     event.preventDefault();
     if (!customName || !customDescription) return;
@@ -63,7 +82,18 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     const acceptedProposals = proposals
       .filter((p) => accepted.has(p.name))
       .map((p) => ({ name: p.name, theme: p.theme }));
-    await submitOnboardingSelection(acceptedProposals, customAdditions);
+    const adoptedPlaylists = existingPlaylists
+      .filter((p) => checkedPlaylistKeys.has(`existing:${p.playlist_id}`))
+      .map((p) => ({ playlist_id: p.playlist_id, name: p.title }));
+    const removedPlaylistIds = addedPlaylists
+      .filter((p) => !checkedPlaylistKeys.has(`added:${p.id}`))
+      .map((p) => p.id);
+    await submitOnboardingSelection(
+      acceptedProposals,
+      customAdditions,
+      adoptedPlaylists,
+      removedPlaylistIds,
+    );
     setDone(true);
     // Calling onComplete() synchronously here batches with setDone(true) into
     // one React update, so App.tsx switches pages before the "done" message
@@ -92,35 +122,66 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
         <>
           <section className={CARD}>
             <h2 className="mb-3 text-sm font-semibold text-slate-700">
-              Your existing YouTube Music playlists
+              Your YouTube Music playlists
             </h2>
-            {existingPlaylists.length === 0 && (
+            <p className="mb-3 text-sm text-slate-500">
+              Checked playlists are managed by this app — new songs can be automatically
+              matched into them, and you can approve or drag songs into them from the Review
+              Queue. Uncheck one to stop managing it (its songs and the playlist itself stay
+              on YouTube untouched); check one to start.
+            </p>
+            {addedPlaylists.length === 0 && existingPlaylists.length === 0 && (
               <p className="text-sm text-slate-500">
-                No other playlists found on your YouTube Music account.
+                No playlists found on your YouTube Music account.
               </p>
             )}
-            <ul className="flex flex-col gap-1">
-              {existingPlaylists.map((playlist) => (
-                <li key={playlist.playlist_id} className="text-sm text-slate-700">
-                  {playlist.title}
-                </li>
-              ))}
-            </ul>
-          </section>
-
-          <section className={CARD}>
-            <h2 className="mb-3 text-sm font-semibold text-slate-700">Playlists already added</h2>
-            {addedPlaylists.length === 0 && (
-              <p className="text-sm text-slate-500">
-                No playlists created by this app yet.
-              </p>
-            )}
-            <ul className="flex flex-col gap-1">
-              {addedPlaylists.map((playlist) => (
-                <li key={playlist.id} className="text-sm text-slate-700">
-                  {playlist.name}
-                </li>
-              ))}
+            <ul className="flex flex-col gap-2">
+              {addedPlaylists.map((playlist) => {
+                const key = `added:${playlist.id}`;
+                const isChecked = checkedPlaylistKeys.has(key);
+                return (
+                  <li key={key}>
+                    <label
+                      className={`flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2 text-sm transition-colors ${
+                        isChecked
+                          ? "border-accent bg-indigo-50"
+                          : "border-slate-200 hover:border-slate-300"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => togglePlaylistKey(key)}
+                        className="mt-1 accent-accent"
+                      />
+                      <strong className="text-slate-900">{playlist.name}</strong>
+                    </label>
+                  </li>
+                );
+              })}
+              {existingPlaylists.map((playlist) => {
+                const key = `existing:${playlist.playlist_id}`;
+                const isChecked = checkedPlaylistKeys.has(key);
+                return (
+                  <li key={key}>
+                    <label
+                      className={`flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2 text-sm transition-colors ${
+                        isChecked
+                          ? "border-accent bg-indigo-50"
+                          : "border-slate-200 hover:border-slate-300"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => togglePlaylistKey(key)}
+                        className="mt-1 accent-accent"
+                      />
+                      <strong className="text-slate-900">{playlist.title}</strong>
+                    </label>
+                  </li>
+                );
+              })}
             </ul>
           </section>
 

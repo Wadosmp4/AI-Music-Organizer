@@ -31,6 +31,10 @@ class LibraryRepository:
     def create(self, item: LibraryItem) -> LibraryItem:
         return save(self.session, item)
 
+    def delete(self, item: LibraryItem) -> None:
+        self.session.delete(item)
+        self.session.commit()
+
     def list_for_user(self, user_id: int) -> list[LibraryItem]:
         return list(
             self.session.exec(select(LibraryItem).where(LibraryItem.user_id == user_id))

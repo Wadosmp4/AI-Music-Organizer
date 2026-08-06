@@ -4,6 +4,7 @@ from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
+from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
@@ -217,6 +218,108 @@ def test_custom_playlist_added_during_onboarding_creates_an_empty_playlist_the_s
     assert playlist.description == "upbeat driving songs"
     assert playlist.youtube_playlist_id == "yt-playlist-fake-id"
     assert ReviewQueueRepository(session).list_for_user(user.id) == []
+
+
+def test_adopting_an_existing_youtube_playlist_creates_a_local_record_without_recreating_it(
+    session,
+):
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    service = _service(session, music_client=music_client)
+
+    created = service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        adopted_playlists=[{"playlist_id": "yt-pre-existing", "name": "Road Trip"}],
+    )
+
+    assert len(created) == 1
+    playlist = PlaylistRepository(session).get(created[0].id)
+    assert playlist.name == "Road Trip"
+    assert playlist.youtube_playlist_id == "yt-pre-existing"
+    music_client.create_playlist.assert_not_called()
+
+
+def test_unchecking_an_already_added_playlist_removes_it_without_touching_youtube(session):
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    service = _service(session, music_client=music_client)
+    playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="Workout",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-workout",
+        )
+    )
+
+    created = service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        removed_playlist_ids=[playlist.id],
+    )
+
+    assert created == []
+    assert PlaylistRepository(session).list_for_user(user.id) == []
+    music_client.create_playlist.assert_not_called()
+
+
+def test_removing_a_playlist_clears_dangling_review_queue_references(session):
+    user = _make_user(session)
+    service = _service(session)
+    playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="Workout",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-workout",
+        )
+    )
+    library_item = LibraryRepository(session).create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    queue_repo = ReviewQueueRepository(session)
+    queue_item = queue_repo.create(
+        ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=playlist.id)
+    )
+
+    service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        removed_playlist_ids=[playlist.id],
+    )
+
+    refreshed = queue_repo.get(queue_item.id)
+    assert refreshed.playlist_id is None
+
+
+def test_removing_a_playlist_belonging_to_another_user_is_ignored(session):
+    user = _make_user(session)
+    other_user = _make_user(session)
+    service = _service(session)
+    other_playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=other_user.id,
+            name="Someone Else's",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-other",
+        )
+    )
+
+    service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        removed_playlist_ids=[other_playlist.id],
+    )
+
+    assert PlaylistRepository(session).get(other_playlist.id) is not None
 
 
 def test_rejecting_a_proposed_candidate_creates_nothing(session):

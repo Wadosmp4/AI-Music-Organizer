@@ -7,6 +7,7 @@ import {
   fetchReviewQueue,
   moveItem,
   rejectItem,
+  resetBacklog,
   type AuthStatus,
   type ReviewQueueItem,
 } from "../api/client";
@@ -69,6 +70,7 @@ export function ReviewQueue() {
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [checkMessage, setCheckMessage] = useState<string | null>(null);
+  const [resetting, setResetting] = useState(false);
   const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
   const mountedRef = useRef(true);
 
@@ -107,6 +109,28 @@ export function ReviewQueue() {
       await loadQueue();
     } finally {
       if (mountedRef.current) setChecking(false);
+    }
+  }
+
+  async function handleResetBacklog() {
+    if (
+      !window.confirm(
+        "Restart batches from the beginning? Songs already approved or moved stay untouched, " +
+          "but every other song in the review queue will be cleared and reclassified from scratch.",
+      )
+    ) {
+      return;
+    }
+    setResetting(true);
+    try {
+      const result = await resetBacklog();
+      if (!mountedRef.current) return;
+      setCheckMessage(
+        `Reset ${result.library_items_cleared} song(s) — click "Load next 50 songs" to start batching from the beginning again.`,
+      );
+      await loadQueue();
+    } finally {
+      if (mountedRef.current) setResetting(false);
     }
   }
 
@@ -153,13 +177,22 @@ export function ReviewQueue() {
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold text-slate-900">Review Queue</h1>
-        <button
-          onClick={() => void handleCheckForNewSongs()}
-          disabled={checking}
-          className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
-        >
-          {checking ? "Loading…" : "Load next 50 songs"}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => void handleResetBacklog()}
+            disabled={resetting}
+            className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
+          >
+            {resetting ? "Resetting…" : "Restart batches from the beginning"}
+          </button>
+          <button
+            onClick={() => void handleCheckForNewSongs()}
+            disabled={checking}
+            className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
+          >
+            {checking ? "Loading…" : "Load next 50 songs"}
+          </button>
+        </div>
       </div>
       <ConnectionHealthBanners authStatus={authStatus} />
       {checkMessage && (

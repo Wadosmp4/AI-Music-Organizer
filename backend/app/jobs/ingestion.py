@@ -29,6 +29,12 @@ BACKFILL_BATCH_SIZE = 50
 
 _ACTIVE_QUEUE_STATUSES = {"pending", "write_pending"}
 
+# A review_queue_item in one of these statuses reflects a song already
+# written to a real YouTube playlist (ReviewQueueService.approve/move) --
+# reset_backlog leaves these alone so a redo-the-backfill request never
+# re-adds a song that's already been organized.
+_COMMITTED_QUEUE_STATUSES = {"approved", "moved"}
+
 
 @dataclass
 class IngestionCheckResult:
@@ -131,9 +137,12 @@ def run_ingestion_check(
             )
         )
 
-        if result.playlist_id is None:
-            continue
-
+        # A queue item is created even with no playlist match (playlist_id
+        # None) -- otherwise an unmatched song is a LibraryItem with no
+        # review_queue row at all, invisible everywhere and impossible to
+        # ever manually assign to a playlist. It surfaces in the Review
+        # Queue's "Unassigned" group instead, where it can be dragged onto
+        # a playlist like any other item.
         review_queue_repository.create(
             ReviewQueueItem(
                 user_id=user_id,
@@ -158,6 +167,46 @@ def run_ingestion_check(
         songs_marked_removed=songs_marked_removed,
         backfill_complete=backfill_complete,
     )
+
+
+@dataclass
+class BacklogResetResult:
+    library_items_cleared: int
+
+
+def reset_backlog(
+    library_repository: LibraryRepository,
+    review_queue_repository: ReviewQueueRepository,
+    user_repository: UserRepository,
+    user_id: int,
+) -> BacklogResetResult:
+    """Restarts backfill from the beginning of the user's liked list (a
+    user-requested do-over, e.g. after adding new playlists partway through
+    a backfill run that earlier batches never got a chance to match
+    against). Songs already committed to a playlist (approved/moved --
+    already written to YouTube) are left completely untouched; every other
+    LibraryItem/review_queue_item is deleted so the next check treats those
+    songs as new again and reclassifies them from scratch.
+    """
+    queue_items = review_queue_repository.list_for_user(user_id)
+    committed_library_item_ids = {
+        item.library_item_id for item in queue_items if item.status in _COMMITTED_QUEUE_STATUSES
+    }
+    queue_items_by_library_item_id: dict[int, list[ReviewQueueItem]] = {}
+    for item in queue_items:
+        queue_items_by_library_item_id.setdefault(item.library_item_id, []).append(item)
+
+    cleared = 0
+    for library_item in library_repository.list_for_user(user_id):
+        if library_item.id in committed_library_item_ids:
+            continue
+        for queue_item in queue_items_by_library_item_id.get(library_item.id, []):
+            review_queue_repository.delete(queue_item)
+        library_repository.delete(library_item)
+        cleared += 1
+
+    user_repository.reset_backfill(user_id)
+    return BacklogResetResult(library_items_cleared=cleared)
 
 
 def _mark_removed_songs(

@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock
 
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
-from app.jobs.ingestion import BACKFILL_BATCH_SIZE, run_ingestion_check
+from app.jobs.ingestion import BACKFILL_BATCH_SIZE, reset_backlog, run_ingestion_check
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
 from app.models.review_queue import ReviewQueueItem
@@ -111,6 +111,36 @@ def test_new_liked_song_produces_exactly_one_queue_item(session):
     items = queue_repo.list_for_user(user.id)
     assert len(items) == 1
     assert items[0].playlist_id == playlist.id
+
+
+def test_unmatched_new_song_still_produces_a_queue_item_so_it_can_be_manually_assigned(session):
+    """Previously an unmatched song (playlist_id=None) never got a
+    review_queue_item at all -- the LibraryItem existed but was invisible
+    everywhere and could never be manually assigned to a playlist. It now
+    gets a queue item like any other song, just with playlist_id=None,
+    surfacing in the Review Queue's "Unassigned" group."""
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = [
+        {"videoId": "v1", "title": "Song A", "artists": [{"name": "Artist"}]}
+    ]
+
+    result = run_ingestion_check(
+        music_client=music_client,
+        classification_service=_no_match_classification_service(),
+        library_repository=library_repo,
+        playlist_repository=playlist_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.queue_items_created == 1
+    items = queue_repo.list_for_user(user.id)
+    assert len(items) == 1
+    assert items[0].playlist_id is None
 
 
 def test_already_placed_song_produces_none(session):
@@ -442,3 +472,69 @@ def test_ingestion_staleness_write_racing_concurrent_user_action_is_a_conflict_n
     # never silently overwritten back to "stale" (KTD19).
     assert refreshed_queue_item.status == "write_pending"
     assert refreshed_queue_item.version == 2
+
+
+def test_reset_backlog_clears_uncommitted_songs_and_restarts_backfill(session):
+    user = _onboarded_user(session)
+    UserRepository(session).mark_backfill_completed(user.id)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+
+    library_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    queue_repo.create(
+        ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=None)
+    )
+
+    result = reset_backlog(
+        library_repository=library_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.library_items_cleared == 1
+    assert library_repo.list_for_user(user.id) == []
+    assert queue_repo.list_for_user(user.id) == []
+    fresh_user = user_repo.get(user.id)
+    assert fresh_user.backfill_completed_at is None
+
+
+def test_reset_backlog_leaves_approved_and_moved_songs_untouched(session):
+    user = _onboarded_user(session)
+    UserRepository(session).mark_backfill_completed(user.id)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+
+    approved_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v-approved", title="Approved Song", artist="Artist")
+    )
+    approved_queue_item = queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=approved_item.id,
+            playlist_id=playlist.id,
+            status="approved",
+        )
+    )
+    pending_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v-pending", title="Pending Song", artist="Artist")
+    )
+    queue_repo.create(
+        ReviewQueueItem(user_id=user.id, library_item_id=pending_item.id, playlist_id=playlist.id)
+    )
+
+    result = reset_backlog(
+        library_repository=library_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.library_items_cleared == 1
+    remaining_items = library_repo.list_for_user(user.id)
+    assert [item.id for item in remaining_items] == [approved_item.id]
+    remaining_queue_items = queue_repo.list_for_user(user.id)
+    assert [item.id for item in remaining_queue_items] == [approved_queue_item.id]

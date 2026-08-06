@@ -149,12 +149,16 @@ export function fetchOnboardingAnalysis(): Promise<OnboardingAnalysis> {
 export function submitOnboardingSelection(
   acceptedProposals: { name: string; theme: string }[],
   customPlaylists: { name: string; description: string }[],
+  adoptedPlaylists: { playlist_id: string; name: string }[] = [],
+  removedPlaylistIds: number[] = [],
 ): Promise<{ created_playlists: CreatedPlaylist[] }> {
   return request("/onboarding/select", {
     method: "POST",
     body: JSON.stringify({
       accepted_proposals: acceptedProposals,
       custom_playlists: customPlaylists,
+      adopted_playlists: adoptedPlaylists,
+      removed_playlist_ids: removedPlaylistIds,
     }),
   });
 }
@@ -167,4 +171,8 @@ export function checkForNewSongs(): Promise<{
   backfill_complete: boolean;
 }> {
   return request("/ingestion/check", { method: "POST" });
+}
+
+export function resetBacklog(): Promise<{ library_items_cleared: number }> {
+  return request("/ingestion/reset", { method: "POST" });
 }

@@ -16,6 +16,10 @@ class PlaylistRepository:
     def create(self, playlist: Playlist) -> Playlist:
         return save(self.session, playlist)
 
+    def delete(self, playlist: Playlist) -> None:
+        self.session.delete(playlist)
+        self.session.commit()
+
     def list_for_user(self, user_id: int) -> list[Playlist]:
         return list(
             self.session.exec(select(Playlist).where(Playlist.user_id == user_id))

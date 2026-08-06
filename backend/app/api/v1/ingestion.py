@@ -11,7 +11,7 @@ from app.api.deps import (
     get_music_client,
 )
 from app.integrations.base import MusicServiceClient
-from app.jobs.ingestion import run_ingestion_check
+from app.jobs.ingestion import reset_backlog, run_ingestion_check
 from app.models.user import User
 from app.services.classification import ClassificationService
 
@@ -25,6 +25,10 @@ class IngestionCheckResponse(BaseModel):
     queue_items_created: int
     songs_marked_removed: int
     backfill_complete: bool
+
+
+class BacklogResetResponse(BaseModel):
+    library_items_cleared: int
 
 
 @router.post("/check", response_model=IngestionCheckResponse)
@@ -51,3 +55,17 @@ def check(
         songs_marked_removed=result.songs_marked_removed,
         backfill_complete=result.backfill_complete,
     )
+
+
+@router.post("/reset", response_model=BacklogResetResponse)
+def reset(
+    user: User = Depends(get_default_user),
+    deps: IngestionDependencies = Depends(get_ingestion_dependencies),
+) -> BacklogResetResponse:
+    result = reset_backlog(
+        library_repository=deps.library_repository,
+        review_queue_repository=deps.review_queue_repository,
+        user_repository=deps.user_repository,
+        user_id=user.id,
+    )
+    return BacklogResetResponse(library_items_cleared=result.library_items_cleared)

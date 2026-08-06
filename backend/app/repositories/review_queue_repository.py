@@ -20,6 +20,26 @@ class ReviewQueueRepository:
     def create(self, item: ReviewQueueItem) -> ReviewQueueItem:
         return save(self.session, item)
 
+    def delete(self, item: ReviewQueueItem) -> None:
+        self.session.delete(item)
+        self.session.commit()
+
+    def clear_playlist_references(self, playlist_id: int) -> None:
+        """Un-targets every review_queue_item pointing at a playlist that's
+        about to be deleted (onboarding "uncheck to stop managing" -- see
+        LibraryAnalysisService.complete_onboarding), so no row is left
+        referencing a playlist.id that no longer exists. Not a per-item CAS
+        update: this is an admin-level bulk cleanup triggered by the
+        playlist's owner, not a concurrent single-item write."""
+        items = list(
+            self.session.exec(select(ReviewQueueItem).where(ReviewQueueItem.playlist_id == playlist_id))
+        )
+        for item in items:
+            item.playlist_id = None
+            item.version += 1
+            self.session.add(item)
+        self.session.commit()
+
     def list_for_user(self, user_id: int) -> list[ReviewQueueItem]:
         return list(
             self.session.exec(

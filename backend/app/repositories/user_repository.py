@@ -27,3 +27,11 @@ class UserRepository:
 
     def mark_backfill_completed(self, user_id: int) -> User:
         return self._mark_timestamp(user_id, "backfill_completed_at")
+
+    def reset_backfill(self, user_id: int) -> User:
+        """Clears backfill_completed_at so the next ingestion check restarts
+        backfill from the beginning of the liked-songs list, instead of
+        resuming steady-state from wherever the user left off."""
+        user = self.get(user_id)
+        user.backfill_completed_at = None
+        return save(self.session, user)

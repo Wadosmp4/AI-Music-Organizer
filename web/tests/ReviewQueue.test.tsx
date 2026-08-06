@@ -232,6 +232,49 @@ describe("ReviewQueue", () => {
     expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
   });
 
+  it("resets the backlog and reloads the queue after confirming", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.resetBacklog).mockResolvedValue({ library_items_cleared: 3 });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Restart batches from the beginning"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        'Reset 3 song(s) — click "Load next 50 songs" to start batching from the beginning again.',
+      );
+    });
+    expect(client.resetBacklog).toHaveBeenCalled();
+    // The queue reloads after resetting, on top of the initial mount fetch.
+    expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
+
+    confirmSpy.mockRestore();
+  });
+
+  it("does not reset the backlog when the confirmation is declined", async () => {
+    const item = makeItem();
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Restart batches from the beginning"));
+
+    expect(client.resetBacklog).not.toHaveBeenCalled();
+
+    confirmSpy.mockRestore();
+  });
+
   it("shows only the write-path banner when just the write path is degraded", async () => {
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue({

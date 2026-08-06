@@ -220,15 +220,53 @@ class LibraryAnalysisService:
         user_id: int,
         accepted_proposals: list[dict],
         custom_playlists: list[dict],
+        adopted_playlists: Optional[list[dict]] = None,
+        removed_playlist_ids: Optional[list[int]] = None,
     ) -> list[Playlist]:
         """Creates the real YouTube Music playlist and its empty local record
         per accepted proposal and per custom addition (F5 step 3) — never
         attaches songs, never creates review_queue items. A record without a
         `youtube_playlist_id` could never be approved/moved into later, so
         the YouTube-side create happens here, not deferred to first approve.
+
+        `adopted_playlists` are playlists that already exist on YouTube
+        Music (surfaced by `list_existing_youtube_playlists`) that the user
+        chose to bring under this app's management — no YouTube-side create,
+        just a local record linked to the existing `playlist_id` so
+        classification (`run_ingestion_check`'s `candidates`) and manual
+        approve/move can target it like any app-created playlist.
+
+        `removed_playlist_ids` are the reverse: already-tracked playlists the
+        user unchecked in onboarding, meaning "stop managing this one." Only
+        the local record and its dangling review_queue references are
+        cleared -- the real playlist and its songs on YouTube are never
+        touched. Any review_queue_item still pointing at it (matched or
+        manually assigned, at any status) has its playlist_id reset to None
+        rather than left dangling, since the local Playlist row it named is
+        gone.
+
         Marks onboarding complete so U4's backfill is allowed to start.
         """
+        for playlist_id in removed_playlist_ids or []:
+            playlist = self.playlist_repository.get(playlist_id)
+            if playlist is None or playlist.user_id != user_id:
+                continue
+            self.review_queue_repository.clear_playlist_references(playlist_id)
+            self.playlist_repository.delete(playlist)
+
         created = []
+        for adopted in adopted_playlists or []:
+            created.append(
+                self.playlist_repository.create(
+                    Playlist(
+                        user_id=user_id,
+                        name=adopted["name"],
+                        description=None,
+                        rule=None,
+                        youtube_playlist_id=adopted["playlist_id"],
+                    )
+                )
+            )
         for proposal in accepted_proposals:
             name = proposal["name"]
             description = proposal.get("theme")

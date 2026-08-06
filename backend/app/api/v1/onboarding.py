@@ -54,9 +54,16 @@ class CustomPlaylist(BaseModel):
     description: str
 
 
+class AdoptedPlaylist(BaseModel):
+    playlist_id: str
+    name: str
+
+
 class SelectionRequest(BaseModel):
     accepted_proposals: list[AcceptedProposal] = []
     custom_playlists: list[CustomPlaylist] = []
+    adopted_playlists: list[AdoptedPlaylist] = []
+    removed_playlist_ids: list[int] = []
 
 
 class CreatedPlaylistResponse(BaseModel):
@@ -105,6 +112,8 @@ def select(
         user_id=user.id,
         accepted_proposals=[p.model_dump() for p in body.accepted_proposals],
         custom_playlists=[c.model_dump() for c in body.custom_playlists],
+        adopted_playlists=[a.model_dump() for a in body.adopted_playlists],
+        removed_playlist_ids=body.removed_playlist_ids,
     )
     return SelectionResponse(
         created_playlists=[
