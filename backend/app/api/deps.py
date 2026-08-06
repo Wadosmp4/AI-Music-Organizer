@@ -51,6 +51,10 @@ def get_library_repository(session: Session = Depends(get_session)) -> LibraryRe
     return LibraryRepository(session)
 
 
+def get_playlist_repository(session: Session = Depends(get_session)) -> PlaylistRepository:
+    return PlaylistRepository(session)
+
+
 def get_review_queue_service(
     session: Session = Depends(get_session),
     music_client: MusicServiceClient = Depends(get_music_client),

@@ -3,9 +3,15 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from app.api.deps import DEFAULT_USER_ID, get_library_repository, get_review_queue_service
+from app.api.deps import (
+    DEFAULT_USER_ID,
+    get_library_repository,
+    get_playlist_repository,
+    get_review_queue_service,
+)
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository
+from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import VersionConflictError
 from app.services.review_queue import ItemNotFoundError, ReviewQueueService, StaleItemError
 
@@ -44,10 +50,18 @@ class ReviewQueueItemResponse(BaseModel):
     # queue is unusable (a reviewer can't tell what "library_item_id 42" is).
     title: str
     artist: str
+    # Same reasoning applies to the destination: a bare numeric playlist_id
+    # forces the reviewer to remember which id is which playlist by heart.
+    playlist_name: Optional[str]
 
 
-def _to_response(item: ReviewQueueItem, library_repo: LibraryRepository) -> ReviewQueueItemResponse:
+def _to_response(
+    item: ReviewQueueItem,
+    library_repo: LibraryRepository,
+    playlist_repo: PlaylistRepository,
+) -> ReviewQueueItemResponse:
     library_item = library_repo.get(item.library_item_id)
+    playlist = playlist_repo.get(item.playlist_id) if item.playlist_id is not None else None
     return ReviewQueueItemResponse(
         id=item.id,
         library_item_id=item.library_item_id,
@@ -58,6 +72,7 @@ def _to_response(item: ReviewQueueItem, library_repo: LibraryRepository) -> Revi
         explanation=item.explanation,
         title=library_item.title if library_item else "(unknown song)",
         artist=library_item.artist if library_item else "(unknown artist)",
+        playlist_name=playlist.name if playlist else None,
     )
 
 
@@ -65,8 +80,12 @@ def _to_response(item: ReviewQueueItem, library_repo: LibraryRepository) -> Revi
 def list_review_queue(
     service: ReviewQueueService = Depends(get_review_queue_service),
     library_repo: LibraryRepository = Depends(get_library_repository),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
 ):
-    return [_to_response(item, library_repo) for item in service.list_items(DEFAULT_USER_ID)]
+    return [
+        _to_response(item, library_repo, playlist_repo)
+        for item in service.list_items(DEFAULT_USER_ID)
+    ]
 
 
 @router.post("/{item_id}/approve", response_model=ReviewQueueItemResponse)
@@ -75,9 +94,12 @@ def approve(
     body: ApproveRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
     library_repo: LibraryRepository = Depends(get_library_repository),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
 ):
     try:
-        return _to_response(service.approve(item_id, body.expected_version), library_repo)
+        return _to_response(
+            service.approve(item_id, body.expected_version), library_repo, playlist_repo
+        )
     except _DOMAIN_EXCEPTIONS:
         raise
     except Exception as exc:
@@ -90,9 +112,12 @@ def reject(
     body: RejectRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
     library_repo: LibraryRepository = Depends(get_library_repository),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
 ):
     try:
-        return _to_response(service.reject(item_id, body.expected_version), library_repo)
+        return _to_response(
+            service.reject(item_id, body.expected_version), library_repo, playlist_repo
+        )
     except _DOMAIN_EXCEPTIONS:
         raise
     except Exception as exc:
@@ -105,10 +130,13 @@ def move(
     body: MoveRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
     library_repo: LibraryRepository = Depends(get_library_repository),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
 ):
     try:
         return _to_response(
-            service.move(item_id, body.expected_version, body.new_playlist_id), library_repo
+            service.move(item_id, body.expected_version, body.new_playlist_id),
+            library_repo,
+            playlist_repo,
         )
     except _DOMAIN_EXCEPTIONS:
         raise

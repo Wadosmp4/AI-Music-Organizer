@@ -23,6 +23,7 @@ export interface ReviewQueueItem {
   explanation: ReviewQueueExplanation | null;
   title: string;
   artist: string;
+  playlist_name: string | null;
 }
 
 export interface StatusEntry {

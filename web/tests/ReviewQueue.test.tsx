@@ -42,6 +42,7 @@ function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.Revie
     explanation: { signal: "artist_similarity", detail: "matched" },
     title: "Test Song",
     artist: "Test Artist",
+    playlist_name: "Test Playlist",
     ...overrides,
   };
 }
@@ -51,6 +52,36 @@ beforeEach(() => {
 });
 
 describe("ReviewQueue", () => {
+  it("shows the playlist name in the section header, not just its id", async () => {
+    const item = makeItem({ playlist_id: 10, playlist_name: "J-Pop & J-Rock Anthems" });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+    expect(screen.getByText("J-Pop & J-Rock Anthems")).toBeInTheDocument();
+    expect(screen.queryByText("Playlist #10")).not.toBeInTheDocument();
+  });
+
+  it("falls back to the playlist id when no name is available, and labels unassigned songs", async () => {
+    const named = makeItem({ id: 1, playlist_id: 10, playlist_name: null });
+    const unassigned = makeItem({
+      id: 2,
+      library_item_id: 2,
+      playlist_id: null,
+      playlist_name: null,
+    });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([named, unassigned]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+    expect(screen.getByText("Playlist #10")).toBeInTheDocument();
+    expect(screen.getByText("Unassigned")).toBeInTheDocument();
+  });
+
   it("shows the song title and artist for each queue item", async () => {
     const item = makeItem({ title: "Unravel", artist: "TK from Ling Tosite Sigure" });
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);

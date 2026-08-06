@@ -204,7 +204,7 @@ export function ReviewQueue() {
         >
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
             <h2 className="text-sm font-semibold text-slate-700">
-              Playlist #{playlistId ?? "unassigned"}
+              {playlistId === null ? "Unassigned" : (groupItems[0]?.playlist_name ?? `Playlist #${playlistId}`)}
             </h2>
             {playlistId !== null && (
               <button

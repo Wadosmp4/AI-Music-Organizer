@@ -218,6 +218,27 @@ def test_list_review_queue_via_http(session, api_client):
     assert len(body) == 1
     assert body[0]["title"] == "Song"
     assert body[0]["artist"] == "Artist"
+    assert body[0]["playlist_name"] == "Rock"
+
+
+def test_list_review_queue_via_http_reports_null_playlist_name_when_unassigned(
+    session, api_client
+):
+    user = _seed_default_user(session)
+    library_item = LibraryItem(user_id=user.id, video_id="vid2", title="Song2", artist="Artist2")
+    session.add(library_item)
+    session.commit()
+    session.refresh(library_item)
+    queue_item = ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=None)
+    session.add(queue_item)
+    session.commit()
+
+    response = api_client.get("/api/v1/review-queue")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["playlist_id"] is None
+    assert body[0]["playlist_name"] is None
 
 
 # ---------------------------------------------------------------------------
