@@ -21,6 +21,8 @@ export interface ReviewQueueItem {
   version: number;
   confidence: number | null;
   explanation: ReviewQueueExplanation | null;
+  title: string;
+  artist: string;
 }
 
 export interface StatusEntry {

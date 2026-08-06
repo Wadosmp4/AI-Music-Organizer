@@ -27,6 +27,8 @@ function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.Revie
     version: 1,
     confidence: 0.8,
     explanation: { signal: "artist_similarity", detail: "matched" },
+    title: "Test Song",
+    artist: "Test Artist",
     ...overrides,
   };
 }
@@ -36,6 +38,18 @@ beforeEach(() => {
 });
 
 describe("ReviewQueue", () => {
+  it("shows the song title and artist for each queue item", async () => {
+    const item = makeItem({ title: "Unravel", artist: "TK from Ling Tosite Sigure" });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(<ReviewQueue />);
+
+    const listItem = await screen.findByTestId("queue-item-1");
+    expect(listItem).toHaveTextContent("Unravel");
+    expect(listItem).toHaveTextContent("TK from Ling Tosite Sigure");
+  });
+
   it("removes an item from the visible queue after approving it", async () => {
     const item = makeItem();
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);

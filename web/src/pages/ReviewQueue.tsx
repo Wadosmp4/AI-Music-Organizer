@@ -74,6 +74,9 @@ export function ReviewQueue() {
             {groupItems.map((item) => (
               <li key={item.id} data-testid={`queue-item-${item.id}`}>
                 <div>
+                  <strong>{item.title}</strong> — {item.artist}
+                </div>
+                <div>
                   <strong>Confidence:</strong> {item.confidence?.toFixed(2) ?? "—"}
                 </div>
                 {item.explanation && (

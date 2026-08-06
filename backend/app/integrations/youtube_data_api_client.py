@@ -5,11 +5,12 @@ work for a persistent backend or a remote mobile client. This class
 exposes an authorization URL to redirect the user to, and a
 `exchange_code_for_token` step for the callback to call — wiring the
 actual HTTP redirect/callback routes is an API-layer concern outside
-this integration client.
+this integration client (see app/api/v1/auth_youtube.py).
 """
 
 import re
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from google.auth.transport.requests import Request
@@ -26,6 +27,37 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.readonly"]
 UNAVAILABLE_TITLES = {"Private video", "Deleted video"}
 MUSIC_CATEGORY_ID = "10"  # YouTube's official video category taxonomy
 _CHANNEL_TOPIC_SUFFIX = re.compile(r"\s*-\s*Topic$")
+
+
+class _PendingOAuthState:
+    """Single in-flight OAuth `state` token (CSRF protection for the login
+    flow). This is a personal single-user tool with no session/cookie store
+    (KTD2) — a bare in-memory slot is sufficient because only one browser
+    completes this flow at a time; the callback must present the exact state
+    this process handed out at /authorize, one-time-use."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._state: Optional[str] = None
+
+    def issue(self, state: str) -> None:
+        with self._lock:
+            self._state = state
+
+    def consume(self, state: str) -> bool:
+        """Clears the pending state only on an actual match. A wrong guess
+        (an attacker probing the callback, or a stale/duplicate request)
+        must not invalidate a real in-flight flow — only the true state
+        value consumes the slot, so the legitimate callback can still
+        complete afterward."""
+        with self._lock:
+            matches = self._state is not None and self._state == state
+            if matches:
+                self._state = None
+            return matches
+
+
+pending_oauth_state = _PendingOAuthState()
 
 
 class YouTubeDataApiClient:
@@ -48,14 +80,21 @@ class YouTubeDataApiClient:
             }
         }
 
-    def get_authorization_url(self) -> str:
+    def get_authorization_url(self) -> tuple[str, str]:
+        """Returns (authorization_url, state). The caller must persist `state`
+        (via `pending_oauth_state.issue`) and verify it against whatever the
+        callback receives before calling `exchange_code_for_token` — Google's
+        own oauthlib generates this state for CSRF protection; previously it
+        was silently discarded here, so the callback (once wired up) would
+        have had nothing to check the returned state against.
+        """
         flow = Flow.from_client_config(
             self._client_config(), scopes=SCOPES, redirect_uri=self.redirect_uri
         )
-        auth_url, _ = flow.authorization_url(
+        auth_url, state = flow.authorization_url(
             access_type="offline", include_granted_scopes="true", prompt="consent"
         )
-        return auth_url
+        return auth_url, state
 
     def exchange_code_for_token(self, code: str) -> None:
         flow = Flow.from_client_config(

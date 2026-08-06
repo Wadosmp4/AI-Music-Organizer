@@ -104,7 +104,12 @@ def test_approve_via_http_succeeds_and_calls_music_client(session, api_client, f
     )
 
     assert response.status_code == 200
-    assert response.json()["status"] == "approved"
+    body = response.json()
+    assert body["status"] == "approved"
+    # The song a reviewer just acted on -- previously absent from every
+    # review-queue response, making the queue impossible to actually use.
+    assert body["title"] == "Song"
+    assert body["artist"] == "Artist"
     fake_music_client.add_playlist_items.assert_called_once_with("PL123", [library_item.video_id])
 
 
@@ -208,7 +213,10 @@ def test_list_review_queue_via_http(session, api_client):
     response = api_client.get("/api/v1/review-queue")
 
     assert response.status_code == 200
-    assert len(response.json()) == 1
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["title"] == "Song"
+    assert body[0]["artist"] == "Artist"
 
 
 # ---------------------------------------------------------------------------

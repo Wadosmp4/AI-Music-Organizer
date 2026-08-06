@@ -3,7 +3,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 
-from app.api.deps import DEFAULT_USER_ID, get_review_queue_service
+from app.api.deps import DEFAULT_USER_ID, get_library_repository, get_review_queue_service
+from app.models.review_queue import ReviewQueueItem
+from app.repositories.library_repository import LibraryRepository
 from app.repositories.review_queue_repository import VersionConflictError
 from app.services.review_queue import ItemNotFoundError, ReviewQueueService, StaleItemError
 
@@ -38,11 +40,33 @@ class ReviewQueueItemResponse(BaseModel):
     version: int
     confidence: Optional[float]
     explanation: Optional[dict]
+    # The song a reviewer is actually judging — without these the review
+    # queue is unusable (a reviewer can't tell what "library_item_id 42" is).
+    title: str
+    artist: str
+
+
+def _to_response(item: ReviewQueueItem, library_repo: LibraryRepository) -> ReviewQueueItemResponse:
+    library_item = library_repo.get(item.library_item_id)
+    return ReviewQueueItemResponse(
+        id=item.id,
+        library_item_id=item.library_item_id,
+        playlist_id=item.playlist_id,
+        status=item.status,
+        version=item.version,
+        confidence=item.confidence,
+        explanation=item.explanation,
+        title=library_item.title if library_item else "(unknown song)",
+        artist=library_item.artist if library_item else "(unknown artist)",
+    )
 
 
 @router.get("", response_model=list[ReviewQueueItemResponse])
-def list_review_queue(service: ReviewQueueService = Depends(get_review_queue_service)):
-    return service.list_items(DEFAULT_USER_ID)
+def list_review_queue(
+    service: ReviewQueueService = Depends(get_review_queue_service),
+    library_repo: LibraryRepository = Depends(get_library_repository),
+):
+    return [_to_response(item, library_repo) for item in service.list_items(DEFAULT_USER_ID)]
 
 
 @router.post("/{item_id}/approve", response_model=ReviewQueueItemResponse)
@@ -50,9 +74,10 @@ def approve(
     item_id: int,
     body: ApproveRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
+    library_repo: LibraryRepository = Depends(get_library_repository),
 ):
     try:
-        return service.approve(item_id, body.expected_version)
+        return _to_response(service.approve(item_id, body.expected_version), library_repo)
     except _DOMAIN_EXCEPTIONS:
         raise
     except Exception as exc:
@@ -64,9 +89,10 @@ def reject(
     item_id: int,
     body: RejectRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
+    library_repo: LibraryRepository = Depends(get_library_repository),
 ):
     try:
-        return service.reject(item_id, body.expected_version)
+        return _to_response(service.reject(item_id, body.expected_version), library_repo)
     except _DOMAIN_EXCEPTIONS:
         raise
     except Exception as exc:
@@ -78,9 +104,12 @@ def move(
     item_id: int,
     body: MoveRequest,
     service: ReviewQueueService = Depends(get_review_queue_service),
+    library_repo: LibraryRepository = Depends(get_library_repository),
 ):
     try:
-        return service.move(item_id, body.expected_version, body.new_playlist_id)
+        return _to_response(
+            service.move(item_id, body.expected_version, body.new_playlist_id), library_repo
+        )
     except _DOMAIN_EXCEPTIONS:
         raise
     except Exception as exc:

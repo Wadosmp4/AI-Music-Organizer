@@ -3,6 +3,16 @@ import { useEffect, useState } from "react";
 import { checkForNewSongs, createPlaylist, fetchAuthStatus, type AuthStatus } from "../api/client";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
 
+// Set by app/api/v1/auth_youtube.py's /callback redirect (?youtube_connect=...).
+const YOUTUBE_CONNECT_MESSAGES: Record<string, string> = {
+  success: "YouTube account connected.",
+  denied: "YouTube connection cancelled — you can try again anytime.",
+  state_mismatch: "YouTube connection failed a security check — please try again.",
+  missing_code: "YouTube connection failed — please try again.",
+  not_configured: "YouTube OAuth isn't configured (missing client id/secret in .env).",
+  failed: "YouTube connection failed — please try again.",
+};
+
 export function Settings() {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [name, setName] = useState("");
@@ -11,6 +21,17 @@ export function Settings() {
 
   useEffect(() => {
     void fetchAuthStatus().then(setAuthStatus);
+
+    const params = new URLSearchParams(window.location.search);
+    const connectResult = params.get("youtube_connect");
+    if (connectResult) {
+      setMessage(YOUTUBE_CONNECT_MESSAGES[connectResult] ?? "YouTube connection attempt finished.");
+      // Drop the query param so a page refresh doesn't re-show the message.
+      window.history.replaceState(null, "", window.location.pathname);
+      if (connectResult === "success") {
+        void fetchAuthStatus().then(setAuthStatus);
+      }
+    }
   }, []);
 
   async function handleCreatePlaylist(event: React.FormEvent) {
@@ -51,6 +72,10 @@ export function Settings() {
             <li>GetSongBPM tempo lookup: {authStatus.getsongbpm.status}</li>
           </ul>
         )}
+        {/* Plain <a> (full-page navigation), not a fetch: Google's consent
+            screen can only be reached by the browser actually navigating
+            there, and the CSRF guard in app/main.py exempts GET anyway. */}
+        <a href="/api/v1/auth/youtube/authorize">Connect Google account (new-likes detection)</a>
       </section>
 
       <section>
