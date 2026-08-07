@@ -18,6 +18,7 @@ from app.models.user import User
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
+from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
 from app.services.bpm_lookup import BpmLookupService
@@ -102,6 +103,7 @@ def get_library_analysis_service(
         review_queue_repository=ReviewQueueRepository(session),
         user_repository=UserRepository(session),
         music_client=music_client,
+        reorganize_session_repository=ReorganizeSessionRepository(session),
         genre_lookup=GenreLookupService(session),
         openrouter_api_key=get_settings().openrouter_api_key,
     )

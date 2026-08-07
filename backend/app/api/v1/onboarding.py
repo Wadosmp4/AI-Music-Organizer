@@ -9,12 +9,12 @@ ever creates a review_queue item or touches YouTube.
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
 from app.api.deps import get_default_user, get_library_analysis_service
 from app.models.user import User
-from app.services.library_analysis import LibraryAnalysisService
+from app.services.library_analysis import LibraryAnalysisService, run_reorganize_clustering
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 
@@ -120,4 +120,57 @@ def select(
             CreatedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description)
             for pl in created
         ]
+    )
+
+
+class ReorganizeTriggerResponse(BaseModel):
+    session_id: int
+    clustering_status: str
+
+
+class ReorganizeProposalResponse(BaseModel):
+    name: str
+    theme: str
+    song_count: int
+
+
+class ReorganizeStatusResponse(BaseModel):
+    session_id: int
+    clustering_status: str
+    proposals: list[ReorganizeProposalResponse]
+
+
+@router.post("/reorganize", response_model=ReorganizeTriggerResponse)
+def trigger_reorganize(
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_default_user),
+    service: LibraryAnalysisService = Depends(get_library_analysis_service),
+) -> ReorganizeTriggerResponse:
+    """R1/R2/R3: fetches the complete liked-songs library, reuses-or-creates
+    the user's open reorganize session, and starts clustering as a
+    background task (KTD9) -- the response returns immediately with the
+    session id so the frontend can start polling `/reorganize/{id}`.
+    """
+    reorganize_session, liked_songs = service.trigger_reorganize(user.id)
+    background_tasks.add_task(run_reorganize_clustering, reorganize_session.id, liked_songs)
+    return ReorganizeTriggerResponse(
+        session_id=reorganize_session.id, clustering_status=reorganize_session.clustering_status
+    )
+
+
+@router.get("/reorganize/{session_id}", response_model=ReorganizeStatusResponse)
+def get_reorganize_status(
+    session_id: int,
+    service: LibraryAnalysisService = Depends(get_library_analysis_service),
+) -> ReorganizeStatusResponse:
+    status = service.get_reorganize_status(session_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"reorganize session {session_id} not found")
+    return ReorganizeStatusResponse(
+        session_id=status.session_id,
+        clustering_status=status.clustering_status,
+        proposals=[
+            ReorganizeProposalResponse(name=p.name, theme=p.theme, song_count=p.song_count)
+            for p in status.proposals
+        ],
     )

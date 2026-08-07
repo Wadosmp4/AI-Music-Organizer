@@ -3,7 +3,7 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from app.models.library import LibraryItem
-from app.models.reorganize_session import ReorganizeSession
+from app.models.reorganize_session import PlaylistProposal, ReorganizeSession
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.base import save
 
@@ -20,7 +20,12 @@ class ReorganizeSessionRepository:
         self.session = session
 
     def get(self, session_id: int) -> Optional[ReorganizeSession]:
-        return self.session.get(ReorganizeSession, session_id)
+        # populate_existing=True: this row may have been committed by a
+        # different Session (e.g. the background clustering task, U2, which
+        # opens its own DB session) -- without it, a caller that already
+        # loaded this row earlier in the same Session would get back its own
+        # stale identity-mapped copy instead of the row's current state.
+        return self.session.get(ReorganizeSession, session_id, populate_existing=True)
 
     def create(self, reorganize_session: ReorganizeSession) -> ReorganizeSession:
         return save(self.session, reorganize_session)
@@ -74,3 +79,38 @@ class ReorganizeSessionRepository:
             )
         }
         return len(matched_video_ids) < len(reorganize_session.video_id_snapshot)
+
+    # -- PlaylistProposal (U2, KTD2) --------------------------------------
+
+    def list_proposals(self, reorganize_session_id: int) -> list[PlaylistProposal]:
+        return list(
+            self.session.exec(
+                select(PlaylistProposal)
+                .where(PlaylistProposal.reorganize_session_id == reorganize_session_id)
+                .execution_options(populate_existing=True)
+            )
+        )
+
+    def merge_proposal(self, reorganize_session_id: int, name: str, theme: str, count: int) -> PlaylistProposal:
+        """Persists one batch's clustering result as a durable row, replacing
+        the transient in-memory `merged` dict `propose_new_playlists` used to
+        keep (KTD2): a proposal already surfaced for this session under the
+        same name (case-insensitive) has its song_count accumulated; a new
+        name gets a fresh row. Visibility (MIN_CLUSTER_SIZE) is applied by
+        the reader, not here, so a cluster that only crosses the threshold
+        once later batches merge into it isn't lost in between.
+        """
+        key = name.strip().lower()
+        for proposal in self.list_proposals(reorganize_session_id):
+            if proposal.name.strip().lower() == key:
+                proposal.song_count += count
+                return save(self.session, proposal)
+        return save(
+            self.session,
+            PlaylistProposal(
+                reorganize_session_id=reorganize_session_id,
+                name=name,
+                theme=theme,
+                song_count=count,
+            ),
+        )

@@ -186,3 +186,33 @@ export function checkForNewSongs(): Promise<{
 export function resetBacklog(): Promise<{ library_items_cleared: number }> {
   return request("/ingestion/reset", { method: "POST" });
 }
+
+// U2: "Reorganize My Library" -- fetches the complete liked-songs library and
+// streams AI-clustered new-playlist suggestions in as background batches
+// complete (R1-R3). `clustering_status` is one of "pending" | "in_progress"
+// | "done" | "stalled" ("stalled" means no new suggestion has been persisted
+// in a while -- offer a re-trigger rather than polling forever).
+export interface ReorganizeTrigger {
+  session_id: number;
+  clustering_status: string;
+}
+
+export interface ReorganizeProposal {
+  name: string;
+  theme: string;
+  song_count: number;
+}
+
+export interface ReorganizeStatus {
+  session_id: number;
+  clustering_status: string;
+  proposals: ReorganizeProposal[];
+}
+
+export function triggerReorganize(): Promise<ReorganizeTrigger> {
+  return request<ReorganizeTrigger>("/onboarding/reorganize", { method: "POST" });
+}
+
+export function fetchReorganizeStatus(sessionId: number): Promise<ReorganizeStatus> {
+  return request<ReorganizeStatus>(`/onboarding/reorganize/${sessionId}`);
+}

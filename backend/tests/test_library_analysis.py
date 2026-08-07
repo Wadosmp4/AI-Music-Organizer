@@ -8,6 +8,7 @@ from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
+from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
 from app.services.library_analysis import LibraryAnalysisService
@@ -46,6 +47,7 @@ def _service(session, openrouter_api_key="or-key", music_client=None) -> Library
         review_queue_repository=ReviewQueueRepository(session),
         user_repository=UserRepository(session),
         music_client=music_client or _fake_music_client(),
+        reorganize_session_repository=ReorganizeSessionRepository(session),
         genre_lookup=None,
         openrouter_api_key=openrouter_api_key,
     )
@@ -434,6 +436,121 @@ def test_rejecting_a_proposed_candidate_creates_nothing(session):
 
     assert created == []
     assert PlaylistRepository(session).list_for_user(user.id) == []
+
+
+# -- U2: full-library fetch + progressive suggestion clustering ------------
+
+
+def _fake_liked_songs(video_ids: list[str]) -> list[dict]:
+    return [
+        {"videoId": vid, "title": f"Song {vid}", "artists": [{"name": f"Artist {vid}"}]}
+        for vid in video_ids
+    ]
+
+
+def test_trigger_reorganize_creates_a_session_when_none_exists(session):
+    from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
+
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1", "v2"])
+    service = _service(session, music_client=music_client)
+
+    reorganize_session, liked_songs = service.trigger_reorganize(user.id)
+
+    assert reorganize_session.clustering_status == "in_progress"
+    assert set(reorganize_session.video_id_snapshot) == {"v1", "v2"}
+    assert len(liked_songs) == 2
+    assert ReorganizeSessionRepository(session).get(reorganize_session.id) is not None
+
+
+def test_second_trigger_reuses_the_still_unresolved_session(session):
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+
+    first_session, _ = service.trigger_reorganize(user.id)
+
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1", "v2"])
+    second_session, _ = service.trigger_reorganize(user.id)
+
+    assert second_session.id == first_session.id
+    assert set(second_session.video_id_snapshot) == {"v1", "v2"}
+
+
+def test_reorganize_clustering_persists_proposals_incrementally_and_marks_done(session):
+    from app.services.library_analysis import run_reorganize_clustering
+
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    liked_songs = _fake_liked_songs(["v1", "v2", "v3", "v4"])
+    music_client.get_liked_songs.return_value = liked_songs
+    service = _service(session, music_client=music_client)
+
+    reorganize_session, fetched_songs = service.trigger_reorganize(user.id)
+    assert service.get_reorganize_status(reorganize_session.id).clustering_status == "in_progress"
+
+    mock_response = _mock_cluster_response("Chill Electronic", "Laid-back electronic songs", [0, 1, 2, 3])
+    with patch("app.services.library_analysis.completion", return_value=mock_response):
+        run_reorganize_clustering(reorganize_session.id, fetched_songs, engine=session.get_bind())
+
+    status = service.get_reorganize_status(reorganize_session.id)
+    assert status.clustering_status == "done"
+    assert len(status.proposals) == 1
+    assert status.proposals[0].name == "Chill Electronic"
+    assert status.proposals[0].song_count == 4
+
+
+def test_reorganize_clustering_batch_failure_does_not_block_other_batches(session):
+    """Mirrors _cluster_batch's own broad-except path (KTD18): one batch's
+    LLM failure just leaves its songs unclustered for this pass, it doesn't
+    stop later batches from completing and persisting their own proposals."""
+    from app.services.library_analysis import BATCH_SIZE, run_reorganize_clustering
+
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    video_ids = [f"v{i}" for i in range(BATCH_SIZE + 4)]
+    liked_songs = _fake_liked_songs(video_ids)
+    music_client.get_liked_songs.return_value = liked_songs
+    service = _service(session, music_client=music_client)
+
+    reorganize_session, fetched_songs = service.trigger_reorganize(user.id)
+
+    ok_response = _mock_cluster_response("Second Batch", "theme", [0, 1, 2, 3])
+    responses = [RuntimeError("LLM failure"), ok_response]
+
+    def _fake_completion(*args, **kwargs):
+        result = responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    with patch("app.services.library_analysis.completion", side_effect=_fake_completion):
+        run_reorganize_clustering(reorganize_session.id, fetched_songs, engine=session.get_bind())
+
+    status = service.get_reorganize_status(reorganize_session.id)
+    assert status.clustering_status == "done"
+    assert len(status.proposals) == 1
+    assert status.proposals[0].name == "Second Batch"
+
+
+def test_reorganize_status_reports_stalled_when_no_recent_proposal_activity(session):
+    from datetime import timedelta
+
+    from app.models.base import utcnow
+    from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
+
+    user = _make_user(session)
+    service = _service(session)
+
+    reorganize_session_repo = ReorganizeSessionRepository(session)
+    reorganize_session, _ = service.trigger_reorganize(user.id)
+    reorganize_session.updated_at = utcnow() - timedelta(seconds=999)
+    reorganize_session_repo.update(reorganize_session)
+
+    status = service.get_reorganize_status(reorganize_session.id)
+    assert status.clustering_status == "stalled"
 
 
 def test_onboarding_completion_is_gated_until_selection_finishes(session):
