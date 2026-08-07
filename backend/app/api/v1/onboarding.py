@@ -14,7 +14,11 @@ from pydantic import BaseModel
 
 from app.api.deps import get_default_user, get_library_analysis_service
 from app.models.user import User
-from app.services.library_analysis import LibraryAnalysisService, run_reorganize_clustering
+from app.services.library_analysis import (
+    LibraryAnalysisService,
+    PlaylistRemovalRequiresConfirmationError,
+    run_reorganize_clustering,
+)
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
 
@@ -64,6 +68,11 @@ class SelectionRequest(BaseModel):
     custom_playlists: list[CustomPlaylist] = []
     adopted_playlists: list[AdoptedPlaylist] = []
     removed_playlist_ids: list[int] = []
+    # KTD7: playlist ids the user has explicitly confirmed removing despite
+    # having non-terminal (pending/approved_pending_apply) review work still
+    # referencing them -- omitted ids that turn out to need confirmation
+    # cause a 409 (see select()) instead of silently proceeding.
+    confirmed_removed_playlist_ids: list[int] = []
 
 
 class CreatedPlaylistResponse(BaseModel):
@@ -108,13 +117,25 @@ def select(
     user: User = Depends(get_default_user),
     service: LibraryAnalysisService = Depends(get_library_analysis_service),
 ) -> SelectionResponse:
-    created = service.complete_onboarding(
-        user_id=user.id,
-        accepted_proposals=[p.model_dump() for p in body.accepted_proposals],
-        custom_playlists=[c.model_dump() for c in body.custom_playlists],
-        adopted_playlists=[a.model_dump() for a in body.adopted_playlists],
-        removed_playlist_ids=body.removed_playlist_ids,
-    )
+    try:
+        created = service.complete_onboarding(
+            user_id=user.id,
+            accepted_proposals=[p.model_dump() for p in body.accepted_proposals],
+            custom_playlists=[c.model_dump() for c in body.custom_playlists],
+            adopted_playlists=[a.model_dump() for a in body.adopted_playlists],
+            removed_playlist_ids=body.removed_playlist_ids,
+            confirmed_removed_playlist_ids=body.confirmed_removed_playlist_ids,
+        )
+    except PlaylistRemovalRequiresConfirmationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "removal_requires_confirmation",
+                "playlist_id": exc.playlist_id,
+                "playlist_name": exc.playlist_name,
+                "pending_count": exc.pending_count,
+            },
+        )
     return SelectionResponse(
         created_playlists=[
             CreatedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description)

@@ -252,6 +252,24 @@ def run_reorganize_clustering(
             reorganize_session_repo.update(reorganize_session)
 
 
+class PlaylistRemovalRequiresConfirmationError(Exception):
+    """Raised by complete_onboarding (U3, KTD7) when unchecking an
+    already-tracked playlist would silently orphan non-terminal review work
+    (pending/approved_pending_apply items still referencing it). The caller
+    must resubmit with this playlist id included in
+    `confirmed_removed_playlist_ids` to proceed anyway.
+    """
+
+    def __init__(self, playlist_id: int, playlist_name: str, pending_count: int):
+        self.playlist_id = playlist_id
+        self.playlist_name = playlist_name
+        self.pending_count = pending_count
+        super().__init__(
+            f"playlist {playlist_id} ({playlist_name!r}) has {pending_count} "
+            "pending/approved_pending_apply item(s) referencing it -- confirm removal to proceed"
+        )
+
+
 class LibraryAnalysisService:
     def __init__(
         self,
@@ -418,12 +436,19 @@ class LibraryAnalysisService:
         custom_playlists: list[dict],
         adopted_playlists: Optional[list[dict]] = None,
         removed_playlist_ids: Optional[list[int]] = None,
+        confirmed_removed_playlist_ids: Optional[list[int]] = None,
     ) -> list[Playlist]:
-        """Creates the real YouTube Music playlist and its empty local record
-        per accepted proposal and per custom addition (F5 step 3) — never
-        attaches songs, never creates review_queue items. A record without a
-        `youtube_playlist_id` could never be approved/moved into later, so
-        the YouTube-side create happens here, not deferred to first approve.
+        """Creates the local playlist record per accepted proposal and per
+        custom addition (F5 step 3) — never attaches songs, never creates
+        review_queue items.
+
+        Suggested/custom playlists get a real YouTube-side create
+        immediately UNLESS the user has an open reorganize session (KTD6):
+        during Reorganize, the local `Playlist` row is created right away
+        with `youtube_playlist_id=None` so session-scoped matching (U4) can
+        run against it, but the actual YouTube playlist isn't created until
+        Finish & Apply (U6) -- avoiding creating YouTube playlists for
+        selections the user might still back out of before applying.
 
         `adopted_playlists` are playlists that already exist on YouTube
         Music (surfaced by `list_existing_youtube_playlists`) that the user
@@ -433,22 +458,48 @@ class LibraryAnalysisService:
         approve/move can target it like any app-created playlist.
 
         `removed_playlist_ids` are the reverse: already-tracked playlists the
-        user unchecked in onboarding, meaning "stop managing this one." Only
-        the local record and its dangling review_queue references are
-        cleared -- the real playlist and its songs on YouTube are never
-        touched. Any review_queue_item still pointing at it (matched or
-        manually assigned, at any status) has its playlist_id reset to None
-        rather than left dangling, since the local Playlist row it named is
-        gone.
+        user unchecked, meaning "stop managing this one." Blocked (KTD7,
+        `PlaylistRemovalRequiresConfirmationError`) whenever any
+        pending/approved_pending_apply review_queue_item still references
+        it, unless its id is also present in `confirmed_removed_playlist_ids`
+        -- unlike onboarding's original invariant (no review work could
+        exist yet), Reorganize can easily have live decisions pending
+        against a playlist the user is now unchecking. Once removal
+        proceeds, only the local record and its dangling review_queue
+        references are cleared -- the real playlist and its songs on
+        YouTube are never touched. Any review_queue_item still pointing at
+        it (matched or manually assigned, at any status) has its
+        playlist_id reset to None rather than left dangling, since the
+        local Playlist row it named is gone.
 
         Marks onboarding complete so U4's backfill is allowed to start.
         """
+        confirmed_ids = set(confirmed_removed_playlist_ids or [])
+        removals = []
         for playlist_id in removed_playlist_ids or []:
             playlist = self.playlist_repository.get(playlist_id)
             if playlist is None or playlist.user_id != user_id:
                 continue
-            self.review_queue_repository.clear_playlist_references(playlist_id)
+            if playlist_id not in confirmed_ids:
+                pending_count = self.review_queue_repository.count_non_terminal_references(
+                    playlist_id
+                )
+                if pending_count > 0:
+                    raise PlaylistRemovalRequiresConfirmationError(
+                        playlist_id, playlist.name, pending_count
+                    )
+            removals.append(playlist)
+
+        for playlist in removals:
+            self.review_queue_repository.clear_playlist_references(playlist.id)
             self.playlist_repository.delete(playlist)
+
+        # KTD6: an open reorganize session defers the actual YouTube create
+        # for suggested/custom selections to Finish & Apply (U6).
+        has_open_session = (
+            self.reorganize_session_repository is not None
+            and self.reorganize_session_repository.get_open_for_user(user_id) is not None
+        )
 
         created = []
         for adopted in adopted_playlists or []:
@@ -466,7 +517,9 @@ class LibraryAnalysisService:
         for proposal in accepted_proposals:
             name = proposal["name"]
             description = proposal.get("theme")
-            youtube_playlist_id = self.music_client.create_playlist(name, description or "")
+            youtube_playlist_id = (
+                None if has_open_session else self.music_client.create_playlist(name, description or "")
+            )
             created.append(
                 self.playlist_repository.create(
                     Playlist(
@@ -481,7 +534,9 @@ class LibraryAnalysisService:
         for custom in custom_playlists:
             name = custom["name"]
             description = custom.get("description")
-            youtube_playlist_id = self.music_client.create_playlist(name, description or "")
+            youtube_playlist_id = (
+                None if has_open_session else self.music_client.create_playlist(name, description or "")
+            )
             created.append(
                 self.playlist_repository.create(
                     Playlist(

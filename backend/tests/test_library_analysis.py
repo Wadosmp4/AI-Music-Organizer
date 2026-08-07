@@ -373,6 +373,8 @@ def test_unchecking_an_already_added_playlist_removes_it_without_touching_youtub
 
 
 def test_removing_a_playlist_clears_dangling_review_queue_references(session):
+    """Also covers U3/KTD7: this playlist has a pending item referencing it,
+    so removal is blocked unless explicitly confirmed."""
     user = _make_user(session)
     service = _service(session)
     playlist = PlaylistRepository(session).create(
@@ -397,6 +399,7 @@ def test_removing_a_playlist_clears_dangling_review_queue_references(session):
         accepted_proposals=[],
         custom_playlists=[],
         removed_playlist_ids=[playlist.id],
+        confirmed_removed_playlist_ids=[playlist.id],
     )
 
     refreshed = queue_repo.get(queue_item.id)
@@ -564,3 +567,184 @@ def test_onboarding_completion_is_gated_until_selection_finishes(session):
 
     completed = UserRepository(session).get(user.id)
     assert completed.onboarding_completed_at is not None
+
+
+# -- U3: playlist selection persistence for the session ---------------------
+
+
+def test_selecting_a_proposed_playlist_during_an_open_session_defers_the_youtube_create(session):
+    """KTD6: during an active reorganize session, accepting a proposal
+    creates the local Playlist row immediately but leaves the YouTube create
+    to Finish & Apply (U6)."""
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+    service.trigger_reorganize(user.id)
+
+    created = service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[{"name": "Chill Electronic", "theme": "Laid-back electronic songs"}],
+        custom_playlists=[],
+    )
+
+    assert len(created) == 1
+    assert created[0].youtube_playlist_id is None
+    music_client.create_playlist.assert_not_called()
+
+
+def test_selecting_a_custom_playlist_during_an_open_session_defers_the_youtube_create(session):
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+    service.trigger_reorganize(user.id)
+
+    created = service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[{"name": "Road Trip", "description": "upbeat driving songs"}],
+    )
+
+    assert len(created) == 1
+    assert created[0].youtube_playlist_id is None
+    music_client.create_playlist.assert_not_called()
+
+
+def test_adopting_an_existing_playlist_during_an_open_session_still_links_immediately(session):
+    """KTD6/U3 approach step 2: adopting an existing YouTube playlist keeps
+    today's behavior regardless of session state -- no create call either
+    way, so nothing to defer."""
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+    service.trigger_reorganize(user.id)
+
+    created = service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        adopted_playlists=[{"playlist_id": "yt-pre-existing", "name": "Road Trip"}],
+    )
+
+    assert created[0].youtube_playlist_id == "yt-pre-existing"
+    music_client.create_playlist.assert_not_called()
+
+
+def test_unchecking_a_playlist_with_pending_work_is_blocked_without_confirmation(session):
+    from app.services.library_analysis import PlaylistRemovalRequiresConfirmationError
+
+    user = _make_user(session)
+    service = _service(session)
+    playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="Workout",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-workout",
+        )
+    )
+    library_item = LibraryRepository(session).create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    ReviewQueueRepository(session).create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=library_item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+        )
+    )
+
+    try:
+        service.complete_onboarding(
+            user_id=user.id,
+            accepted_proposals=[],
+            custom_playlists=[],
+            removed_playlist_ids=[playlist.id],
+        )
+        assert False, "expected PlaylistRemovalRequiresConfirmationError"
+    except PlaylistRemovalRequiresConfirmationError as exc:
+        assert exc.playlist_id == playlist.id
+        assert exc.pending_count == 1
+
+    # Nothing was removed.
+    assert PlaylistRepository(session).get(playlist.id) is not None
+
+
+def test_unchecking_a_playlist_with_pending_work_proceeds_once_confirmed(session):
+    user = _make_user(session)
+    service = _service(session)
+    playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="Workout",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-workout",
+        )
+    )
+    library_item = LibraryRepository(session).create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    queue_repo = ReviewQueueRepository(session)
+    queue_item = queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=library_item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+        )
+    )
+
+    service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        removed_playlist_ids=[playlist.id],
+        confirmed_removed_playlist_ids=[playlist.id],
+    )
+
+    assert PlaylistRepository(session).get(playlist.id) is None
+    assert queue_repo.get(queue_item.id).playlist_id is None
+
+
+def test_unchecking_a_playlist_with_no_pending_work_proceeds_without_confirmation(session):
+    """Same as today's behavior when there's nothing at stake."""
+    user = _make_user(session)
+    service = _service(session)
+    playlist = PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="Workout",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-workout",
+        )
+    )
+
+    service.complete_onboarding(
+        user_id=user.id,
+        accepted_proposals=[],
+        custom_playlists=[],
+        removed_playlist_ids=[playlist.id],
+    )
+
+    assert PlaylistRepository(session).get(playlist.id) is None
+
+
+def test_declined_suggestion_is_not_remembered_and_can_resurface_later(session):
+    """R5: declining is simply never accepting a proposal -- no suppression
+    state is written anywhere, so an unrelated later run's clustering pass
+    is free to propose the same cluster again."""
+    user = _make_user(session)
+    service = _service(session)
+
+    # "Declining" Chill Electronic is simply never passing it to
+    # complete_onboarding's accepted_proposals.
+    created = service.complete_onboarding(user_id=user.id, accepted_proposals=[], custom_playlists=[])
+
+    assert created == []
+    assert PlaylistRepository(session).list_for_user(user.id) == []

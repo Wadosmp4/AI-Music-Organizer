@@ -30,7 +30,12 @@ class ReviewQueueRepository:
         LibraryAnalysisService.complete_onboarding), so no row is left
         referencing a playlist.id that no longer exists. Not a per-item CAS
         update: this is an admin-level bulk cleanup triggered by the
-        playlist's owner, not a concurrent single-item write."""
+        playlist's owner, not a concurrent single-item write.
+
+        Callers must check `count_non_terminal_references` first (KTD7) --
+        this method itself performs no such guard, since it's also the
+        confirmed-removal path once the caller has decided to proceed.
+        """
         items = list(
             self.session.exec(select(ReviewQueueItem).where(ReviewQueueItem.playlist_id == playlist_id))
         )
@@ -38,6 +43,29 @@ class ReviewQueueRepository:
             item.playlist_id = None
             item.version += 1
             self.session.add(item)
+        self.session.commit()
+
+    # Statuses representing real, still-undecided-or-unwritten work against a
+    # playlist (KTD7) -- distinct from PLACED_STATUSES/ACTIVE_QUEUE_STATUSES
+    # elsewhere, this is specifically "would this uncheck silently orphan
+    # work the user hasn't resolved yet."
+    _NON_TERMINAL_REFERENCE_STATUSES = ("pending", "approved_pending_apply")
+
+    def count_non_terminal_references(self, playlist_id: int) -> int:
+        """KTD7: counts review_queue_items still referencing this playlist
+        that aren't yet a finished outcome (pending or
+        approved_pending_apply). Used to block unchecking an already-tracked
+        playlist during Reorganize pending explicit confirmation -- today's
+        unconditional `clear_playlist_references` null-out was only safe
+        under onboarding's old invariant that no review work could exist yet.
+        """
+        items = self.session.exec(
+            select(ReviewQueueItem).where(
+                ReviewQueueItem.playlist_id == playlist_id,
+                ReviewQueueItem.status.in_(self._NON_TERMINAL_REFERENCE_STATUSES),
+            )
+        )
+        return len(list(items))
         self.session.commit()
 
     def list_for_user(self, user_id: int) -> list[ReviewQueueItem]:
