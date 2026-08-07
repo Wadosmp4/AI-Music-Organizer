@@ -129,3 +129,25 @@ def get_ingestion_dependencies(session: Session = Depends(get_session)) -> Inges
         review_queue_repository=ReviewQueueRepository(session),
         user_repository=UserRepository(session),
     )
+
+
+@dataclass
+class ReorganizeMatchingDependencies:
+    """Bundles the repositories `run_reorganize_matching_batch` needs (U4) --
+    same rationale as IngestionDependencies above."""
+
+    library_repository: LibraryRepository
+    playlist_repository: PlaylistRepository
+    review_queue_repository: ReviewQueueRepository
+    reorganize_session_repository: ReorganizeSessionRepository
+
+
+def get_reorganize_matching_dependencies(
+    session: Session = Depends(get_session),
+) -> ReorganizeMatchingDependencies:
+    return ReorganizeMatchingDependencies(
+        library_repository=LibraryRepository(session),
+        playlist_repository=PlaylistRepository(session),
+        review_queue_repository=ReviewQueueRepository(session),
+        reorganize_session_repository=ReorganizeSessionRepository(session),
+    )

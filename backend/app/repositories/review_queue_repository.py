@@ -66,6 +66,26 @@ class ReviewQueueRepository:
             )
         )
         return len(list(items))
+
+    # Statuses reflecting a real, still-live-or-committed candidate
+    # placement for a (library_item, playlist) pair (U4, KTD8) -- broader
+    # than _NON_TERMINAL_REFERENCE_STATUSES above since a written
+    # approved/moved pair must also never be re-matched into a duplicate row.
+    _ACTIVE_MATCH_STATUSES = {"pending", "write_pending", "approved", "moved", "approved_pending_apply"}
+
+    def active_pairs_for_user(self, user_id: int) -> set[tuple[int, int]]:
+        """Batch-friendly generalization of the single-pair dedup check
+        ReviewQueueService._active_item_for_playlist already does one pair
+        at a time (U4, KTD8) -- returns every (library_item_id, playlist_id)
+        pair that already has an active/committed candidate row, so the
+        session-scoped matching job can skip creating a duplicate without a
+        query per song per playlist.
+        """
+        return {
+            (item.library_item_id, item.playlist_id)
+            for item in self.list_for_user(user_id)
+            if item.playlist_id is not None and item.status in self._ACTIVE_MATCH_STATUSES
+        }
         self.session.commit()
 
     def list_for_user(self, user_id: int) -> list[ReviewQueueItem]:
