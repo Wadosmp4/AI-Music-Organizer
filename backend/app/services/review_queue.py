@@ -109,6 +109,15 @@ class ReviewQueueService:
         item = self._require_item(item_id)
         self._check_not_stale(item)
 
+        if item.reorganize_session_id is not None:
+            # KTD1/KTD4: a session-tagged item defers the write entirely --
+            # no youtube_playlist_id presence check, no external call. CAS
+            # straight to the real, decided-but-unwritten state; Finish &
+            # Apply (U6) is what actually writes it later.
+            return self.review_queue_repo.update(
+                item_id, expected_version, status="approved_pending_apply"
+            )
+
         # Resolved before the write_pending CAS: a missing youtube_playlist_id
         # is a data problem (the destination playlist was never linked), not a
         # write-path failure — it must raise ItemNotFoundError untouched, not
@@ -137,29 +146,43 @@ class ReviewQueueService:
         self._check_not_stale(item)
 
         old_playlist_id = item.playlist_id
-        # Resolved before the write_pending CAS — see the matching comment in
-        # approve(): a missing youtube_playlist_id on the destination playlist
-        # must raise ItemNotFoundError untouched, not get mislabeled as a
-        # write-path auth failure.
-        youtube_playlist_id = self._youtube_playlist_id(new_playlist_id)
+
+        if item.reorganize_session_id is not None:
+            # KTD1/KTD4: same deferred-write branch as approve() -- CAS
+            # straight to approved_pending_apply with the new playlist_id,
+            # no external call.
+            moved_item = self.review_queue_repo.update(
+                item_id, expected_version, status="approved_pending_apply", playlist_id=new_playlist_id
+            )
+        else:
+            # Resolved before the write_pending CAS — see the matching comment in
+            # approve(): a missing youtube_playlist_id on the destination playlist
+            # must raise ItemNotFoundError untouched, not get mislabeled as a
+            # write-path auth failure.
+            youtube_playlist_id = self._youtube_playlist_id(new_playlist_id)
+            library_item = self.library_repo.get(item.library_item_id)
+            pending_item = self.review_queue_repo.update(
+                item_id, expected_version, status="write_pending", playlist_id=new_playlist_id
+            )
+
+            try:
+                self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
+            except Exception as exc:
+                auth_status_store.set_write_status(
+                    AuthStatus.NEEDS_RECONNECT, f"move write failed: {exc}"
+                )
+                self._complete_pending_write(
+                    pending_item, "pending", write_succeeded=False, playlist_id=old_playlist_id
+                )
+                raise
+
+            moved_item = self._complete_pending_write(pending_item, "moved", write_succeeded=True)
+
+        # KTD5: fires for every correction, in-session or not -- decoupled
+        # from whether an external write actually happened, so the reorganize
+        # pass most likely to contain the most corrections doesn't silently
+        # lose the classification-learning signal.
         library_item = self.library_repo.get(item.library_item_id)
-        pending_item = self.review_queue_repo.update(
-            item_id, expected_version, status="write_pending", playlist_id=new_playlist_id
-        )
-
-        try:
-            self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
-        except Exception as exc:
-            auth_status_store.set_write_status(
-                AuthStatus.NEEDS_RECONNECT, f"move write failed: {exc}"
-            )
-            self._complete_pending_write(
-                pending_item, "pending", write_succeeded=False, playlist_id=old_playlist_id
-            )
-            raise
-
-        moved_item = self._complete_pending_write(pending_item, "moved", write_succeeded=True)
-
         self.correction_log_repo.create(
             CorrectionLogEntry(
                 user_id=item.user_id,
@@ -211,6 +234,10 @@ class ReviewQueueService:
                 library_item_id=item.library_item_id,
                 playlist_id=target_playlist_id,
                 status="pending",
+                # KTD4: inherits the session tag from the item it splits
+                # from, so a manual multi-playlist add during an open
+                # session is deferred like any other session-tagged row.
+                reorganize_session_id=item.reorganize_session_id,
                 confidence=None,
                 explanation={"signal": "manual", "detail": "manually added to this playlist"},
             )
@@ -223,7 +250,7 @@ class ReviewQueueService:
         for a song/playlist pair that's already an active candidate there
         (e.g. the user clicks "Add to X" twice, or X already holds this
         song's original algorithmic suggestion)."""
-        active_statuses = {"pending", "write_pending", "approved", "moved"}
+        active_statuses = {"pending", "write_pending", "approved", "moved", "approved_pending_apply"}
         for candidate in self.review_queue_repo.list_for_user(user_id):
             if (
                 candidate.library_item_id == library_item_id

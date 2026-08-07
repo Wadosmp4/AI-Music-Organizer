@@ -593,6 +593,43 @@ def test_ingestion_staleness_write_racing_concurrent_user_action_is_a_conflict_n
     assert refreshed_queue_item.version == 2
 
 
+def test_mark_removed_songs_marks_an_approved_pending_apply_item_stale(session):
+    """U5/KTD3: _ACTIVE_QUEUE_STATUSES includes approved_pending_apply so an
+    unliked song still in that state gets caught by the ordinary ingestion
+    check's staleness pass, not just by U6's own Finish & Apply
+    reconciliation."""
+    from app.jobs.ingestion import _mark_removed_songs
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+    library_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    queue_item = queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=library_item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+        )
+    )
+
+    songs_marked_removed = _mark_removed_songs(
+        existing_items=[library_item],
+        liked_video_ids=set(),
+        queue_items_snapshot=[queue_item],
+        library_repository=library_repo,
+        review_queue_repository=queue_repo,
+    )
+
+    assert songs_marked_removed == 1
+    refreshed = queue_repo.get(queue_item.id)
+    assert refreshed.status == "stale"
+
+
 def test_reset_backlog_clears_uncommitted_songs_and_restarts_backfill(session):
     user = _onboarded_user(session)
     UserRepository(session).mark_backfill_completed(user.id)
@@ -657,3 +694,37 @@ def test_reset_backlog_leaves_approved_and_moved_songs_untouched(session):
     assert [item.id for item in remaining_items] == [approved_item.id]
     remaining_queue_items = queue_repo.list_for_user(user.id)
     assert [item.id for item in remaining_queue_items] == [approved_queue_item.id]
+
+
+def test_reset_backlog_leaves_approved_pending_apply_songs_untouched(session):
+    """U5/KTD3: a session-decided-but-unwritten item is a real decided state
+    -- reset_backlog must not silently discard it."""
+    user = _onboarded_user(session)
+    UserRepository(session).mark_backfill_completed(user.id)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+
+    deferred_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v-deferred", title="Deferred Song", artist="Artist")
+    )
+    deferred_queue_item = queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=deferred_item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+        )
+    )
+
+    result = reset_backlog(
+        library_repository=library_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.library_items_cleared == 0
+    assert [item.id for item in library_repo.list_for_user(user.id)] == [deferred_item.id]
+    assert [item.id for item in queue_repo.list_for_user(user.id)] == [deferred_queue_item.id]

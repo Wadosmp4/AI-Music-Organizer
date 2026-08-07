@@ -72,3 +72,28 @@ def test_a_rejected_item_is_still_unplaced(session):
     unplaced = unplaced_library_items(user.id, library_repo, queue_repo)
 
     assert [i.id for i in unplaced] == [item.id]
+
+
+def test_an_approved_pending_apply_item_is_placed(session):
+    """U5/KTD3: a song with only a session-tagged, decided-but-unwritten
+    item is placed -- not eligible for re-clustering, same as approved/moved."""
+    user = _make_user(session)
+    library_repo = LibraryRepository(session)
+    playlist_repo = PlaylistRepository(session)
+    queue_repo = ReviewQueueRepository(session)
+    playlist = playlist_repo.create(Playlist(user_id=user.id, name="Rock", description=None, rule=None))
+    item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+        )
+    )
+
+    unplaced = unplaced_library_items(user.id, library_repo, queue_repo)
+
+    assert unplaced == []

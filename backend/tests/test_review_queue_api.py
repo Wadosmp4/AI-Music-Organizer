@@ -8,6 +8,7 @@ from sqlmodel import Session as SQLSession
 from app.integrations.auth_status import AuthStatus, auth_status_store
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
+from app.models.reorganize_session import ReorganizeSession
 from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
 from app.repositories.correction_log_repository import CorrectionLogRepository
@@ -337,4 +338,82 @@ def test_add_to_playlist_targeting_the_items_current_playlist_is_a_noop(session,
     )
 
     assert result.id == seeded["queue_item"].id
+    music_client.add_playlist_items.assert_not_called()
+
+
+# -- U5: deferred-write approve/move for session-tagged items ----------------
+
+
+def test_approving_a_session_tagged_item_defers_the_write(session, seeded):
+    reorganize_session = ReorganizeSession(user_id=seeded["user"].id, video_id_snapshot=["vid1"])
+    session.add(reorganize_session)
+    session.commit()
+    session.refresh(reorganize_session)
+    seeded["queue_item"].reorganize_session_id = reorganize_session.id
+    session.add(seeded["queue_item"])
+    session.commit()
+
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.approve(seeded["queue_item"].id, expected_version=1)
+
+    assert result.status == "approved_pending_apply"
+    music_client.add_playlist_items.assert_not_called()
+
+
+def test_approving_a_non_session_item_behaves_exactly_as_today(session, seeded):
+    """AE1: no session tag -> immediate write, unchanged."""
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.approve(seeded["queue_item"].id, expected_version=1)
+
+    assert result.status == "approved"
+    music_client.add_playlist_items.assert_called_once_with("PL123", ["vid1"])
+
+
+def test_moving_a_session_tagged_item_defers_the_write_but_still_logs_a_correction(session, seeded):
+    reorganize_session = ReorganizeSession(user_id=seeded["user"].id, video_id_snapshot=["vid1"])
+    session.add(reorganize_session)
+    session.commit()
+    session.refresh(reorganize_session)
+    seeded["queue_item"].reorganize_session_id = reorganize_session.id
+    session.add(seeded["queue_item"])
+    session.commit()
+
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.move(
+        seeded["queue_item"].id, expected_version=1, new_playlist_id=seeded["other_playlist"].id
+    )
+
+    assert result.status == "approved_pending_apply"
+    assert result.playlist_id == seeded["other_playlist"].id
+    music_client.add_playlist_items.assert_not_called()
+
+    [correction] = service.correction_log_repo.list_for_user(seeded["user"].id)
+    assert correction.original_playlist_id == seeded["playlist"].id
+    assert correction.corrected_playlist_id == seeded["other_playlist"].id
+
+
+def test_adding_a_session_tagged_item_to_a_second_playlist_inherits_the_session_tag(session, seeded):
+    reorganize_session = ReorganizeSession(user_id=seeded["user"].id, video_id_snapshot=["vid1"])
+    session.add(reorganize_session)
+    session.commit()
+    session.refresh(reorganize_session)
+    seeded["queue_item"].reorganize_session_id = reorganize_session.id
+    session.add(seeded["queue_item"])
+    session.commit()
+
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.add_to_playlist(
+        seeded["queue_item"].id, expected_version=1, target_playlist_id=seeded["other_playlist"].id
+    )
+
+    assert result.id != seeded["queue_item"].id
+    assert result.reorganize_session_id == reorganize_session.id
     music_client.add_playlist_items.assert_not_called()

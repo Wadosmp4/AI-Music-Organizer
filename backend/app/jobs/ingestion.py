@@ -27,13 +27,16 @@ from app.services.classification import ClassificationService, build_candidate
 # ceiling (KTD21) — the caller repeats the check until backfill_complete.
 BACKFILL_BATCH_SIZE = 50
 
-_ACTIVE_QUEUE_STATUSES = {"pending", "write_pending"}
+_ACTIVE_QUEUE_STATUSES = {"pending", "write_pending", "approved_pending_apply"}
 
 # A review_queue_item in one of these statuses reflects a song already
-# written to a real YouTube playlist (ReviewQueueService.approve/move) --
-# reset_backlog leaves these alone so a redo-the-backfill request never
-# re-adds a song that's already been organized.
-_COMMITTED_QUEUE_STATUSES = {"approved", "moved"}
+# written to a real YouTube playlist (ReviewQueueService.approve/move), or a
+# real decided-but-not-yet-written session-scoped outcome
+# (approved_pending_apply, KTD3) -- reset_backlog leaves these alone so a
+# redo-the-backfill request never re-adds a song that's already been
+# organized, and never silently discards an in-flight reorganize decision
+# either.
+_COMMITTED_QUEUE_STATUSES = {"approved", "moved", "approved_pending_apply"}
 
 
 @dataclass

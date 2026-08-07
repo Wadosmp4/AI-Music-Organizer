@@ -14,7 +14,7 @@ from app.models.library import LibraryItem
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 
-PLACED_STATUSES = {"pending", "write_pending", "approved", "moved"}
+PLACED_STATUSES = {"pending", "write_pending", "approved", "moved", "approved_pending_apply"}
 
 
 def unplaced_library_items(
