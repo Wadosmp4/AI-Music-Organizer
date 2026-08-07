@@ -8,6 +8,7 @@ raised (KTD17), rather than being left stuck as if applied.
 """
 
 import logging
+from typing import Optional
 
 from app.integrations.auth_status import AuthStatus, auth_status_store
 from app.integrations.base import MusicServiceClient, track_from_library_item
@@ -173,3 +174,61 @@ class ReviewQueueService:
             )
         )
         return moved_item
+
+    def add_to_playlist(
+        self, item_id: int, expected_version: int, target_playlist_id: int
+    ) -> ReviewQueueItem:
+        """A song can belong to more than one playlist (e.g. it fits both
+        "Chill" and "Late Night") -- never an eager write. Adding it to a
+        playlist only ever queues it as a *pending* candidate there, exactly
+        like any algorithmic suggestion: it waits for that playlist's own
+        Approve-all, never bypassing the review step (R8/R11).
+
+        - Unassigned (playlist_id is None, e.g. sitting in the Review
+          Queue's "Unassigned" group): this is its first placement decision,
+          so the existing row is simply reassigned to `target_playlist_id`
+          (still "pending" -- no write happens here).
+        - Already assigned: the existing row is untouched (its original
+          suggestion still stands, still pending Approve-all or already
+          approved) -- a second, independent "pending" row is created for
+          the same song under `target_playlist_id`, so the two placements
+          are approved (and written) completely independently.
+        """
+        item = self._require_item(item_id)
+        if item.playlist_id == target_playlist_id:
+            return item
+        if item.playlist_id is None:
+            return self.review_queue_repo.update(
+                item_id, expected_version, playlist_id=target_playlist_id
+            )
+
+        existing = self._active_item_for_playlist(item.user_id, item.library_item_id, target_playlist_id)
+        if existing is not None:
+            return existing
+        return self.review_queue_repo.create(
+            ReviewQueueItem(
+                user_id=item.user_id,
+                library_item_id=item.library_item_id,
+                playlist_id=target_playlist_id,
+                status="pending",
+                confidence=None,
+                explanation={"signal": "manual", "detail": "manually added to this playlist"},
+            )
+        )
+
+    def _active_item_for_playlist(
+        self, user_id: int, library_item_id: int, playlist_id: int
+    ) -> Optional[ReviewQueueItem]:
+        """Guards add_to_playlist against creating a duplicate pending row
+        for a song/playlist pair that's already an active candidate there
+        (e.g. the user clicks "Add to X" twice, or X already holds this
+        song's original algorithmic suggestion)."""
+        active_statuses = {"pending", "write_pending", "approved", "moved"}
+        for candidate in self.review_queue_repo.list_for_user(user_id):
+            if (
+                candidate.library_item_id == library_item_id
+                and candidate.playlist_id == playlist_id
+                and candidate.status in active_statuses
+            ):
+                return candidate
+        return None

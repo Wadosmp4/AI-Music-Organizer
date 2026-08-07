@@ -10,7 +10,9 @@ from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
+from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
 from app.services.classification import ClassificationResult, ClassificationService, Explanation
+from app.services.genre_lookup import GenreLookupService
 
 
 def _onboarded_user(session) -> User:
@@ -32,27 +34,31 @@ def _repos(session):
 
 def _matching_classification_service(playlist_id: int) -> MagicMock:
     service = MagicMock(spec=ClassificationService)
-    service.classify_track.return_value = ClassificationResult(
-        playlist_id=playlist_id,
-        confidence=0.8,
-        explanation=Explanation("artist_similarity", "matched"),
-        bpm=None,
-        bpm_source=None,
-        genre=None,
-    )
+    service.classify_track.return_value = [
+        ClassificationResult(
+            playlist_id=playlist_id,
+            confidence=0.8,
+            explanation=Explanation("artist_similarity", "matched"),
+            bpm=None,
+            bpm_source=None,
+            genre=None,
+        )
+    ]
     return service
 
 
 def _no_match_classification_service() -> MagicMock:
     service = MagicMock(spec=ClassificationService)
-    service.classify_track.return_value = ClassificationResult(
-        playlist_id=None,
-        confidence=0.0,
-        explanation=Explanation("none", "no match"),
-        bpm=None,
-        bpm_source=None,
-        genre=None,
-    )
+    service.classify_track.return_value = [
+        ClassificationResult(
+            playlist_id=None,
+            confidence=0.0,
+            explanation=Explanation("none", "no match"),
+            bpm=None,
+            bpm_source=None,
+            genre=None,
+        )
+    ]
     return service
 
 
@@ -111,6 +117,117 @@ def test_new_liked_song_produces_exactly_one_queue_item(session):
     items = queue_repo.list_for_user(user.id)
     assert len(items) == 1
     assert items[0].playlist_id == playlist.id
+
+
+def test_a_song_matching_two_playlists_is_queued_in_both(session):
+    """The user's own framing: a song isn't limited to one playlist. Two
+    playlists both clear the artist-similarity bar for the same artist --
+    both must get their own pending review_queue_item for this one song."""
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    rock = playlist_repo.create(Playlist(user_id=user.id, name="Rock", description=None, rule=None))
+    favorites = playlist_repo.create(
+        Playlist(user_id=user.id, name="Favorites", description=None, rule=None)
+    )
+
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = [
+        {"videoId": "v1", "title": "Song A", "artists": [{"name": "Queen"}]}
+    ]
+    classification_service = MagicMock(spec=ClassificationService)
+    classification_service.classify_track.return_value = [
+        ClassificationResult(
+            playlist_id=rock.id,
+            confidence=0.8,
+            explanation=Explanation("artist_similarity", "matched Rock"),
+            bpm=None,
+            bpm_source=None,
+            genre=None,
+        ),
+        ClassificationResult(
+            playlist_id=favorites.id,
+            confidence=0.6,
+            explanation=Explanation("description_match", "matched Favorites"),
+            bpm=None,
+            bpm_source=None,
+            genre=None,
+        ),
+    ]
+
+    result = run_ingestion_check(
+        music_client=music_client,
+        classification_service=classification_service,
+        library_repository=library_repo,
+        playlist_repository=playlist_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.new_songs_found == 1
+    assert result.queue_items_created == 2
+    items = queue_repo.list_for_user(user.id)
+    assert {item.playlist_id for item in items} == {rock.id, favorites.id}
+    assert len({item.library_item_id for item in items}) == 1  # both point at the same song
+
+
+def test_adopted_playlists_real_youtube_content_feeds_artist_similarity_matching(session):
+    """End-to-end regression for the "nothing ever matches" gap: candidate
+    playlists' artist_counts used to always be built empty (CandidatePlaylist
+    .from_playlist was never given real counts), so artist-similarity could
+    never fire for a freshly adopted pre-existing YouTube playlist -- it has
+    no local approval history, only real songs already sitting on YouTube.
+    Uses a real ClassificationService (not a stubbed one) to prove the whole
+    path -- run_ingestion_check building candidates from
+    music_client.get_playlist_tracks -- actually routes a same-artist song.
+    """
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(
+            user_id=user.id,
+            name="EDM mix",
+            description=None,
+            rule=None,
+            youtube_playlist_id="yt-edm-mix",
+        )
+    )
+
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = [
+        {"videoId": "v-new", "title": "New Banger", "artists": [{"name": "Daft Punk"}]}
+    ]
+
+    def _get_playlist_tracks(playlist_id):
+        assert playlist_id == "yt-edm-mix"
+        return [
+            {"videoId": f"existing-{i}", "title": "t", "artists": [{"name": "Daft Punk"}]}
+            for i in range(3)
+        ]
+
+    music_client.get_playlist_tracks.side_effect = _get_playlist_tracks
+
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    genre_lookup.genre_for.return_value = None
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    bpm_lookup.openrouter_api_key = None
+    classification_service = ClassificationService(genre_lookup, bpm_lookup)
+
+    result = run_ingestion_check(
+        music_client=music_client,
+        classification_service=classification_service,
+        library_repository=library_repo,
+        playlist_repository=playlist_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.queue_items_created == 1
+    items = queue_repo.list_for_user(user.id)
+    assert items[0].playlist_id == playlist.id
+    assert items[0].explanation["signal"] == "artist_similarity"
 
 
 def test_unmatched_new_song_still_produces_a_queue_item_so_it_can_be_manually_assigned(session):
@@ -396,14 +513,16 @@ def test_classification_failure_leaves_song_out_of_membership_index_so_the_next_
     playlist = playlist_repo.create(
         Playlist(user_id=user.id, name="Rock", description=None, rule=None)
     )
-    classification_service.classify_track.return_value = ClassificationResult(
-        playlist_id=playlist.id,
-        confidence=0.8,
-        explanation=Explanation("artist_similarity", "matched"),
-        bpm=None,
-        bpm_source=None,
-        genre=None,
-    )
+    classification_service.classify_track.return_value = [
+        ClassificationResult(
+            playlist_id=playlist.id,
+            confidence=0.8,
+            explanation=Explanation("artist_similarity", "matched"),
+            bpm=None,
+            bpm_source=None,
+            genre=None,
+        )
+    ]
 
     second = run_ingestion_check(
         music_client=music_client,

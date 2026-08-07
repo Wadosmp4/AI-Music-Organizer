@@ -12,8 +12,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from app.api.deps import get_default_user, get_playlist_creation_service
+from app.api.deps import get_default_user, get_playlist_creation_service, get_playlist_repository
 from app.models.user import User
+from app.repositories.playlist_repository import PlaylistRepository
 from app.services.playlist_creation import PlaylistCreationService
 
 router = APIRouter(prefix="/playlists", tags=["playlists"])
@@ -34,6 +35,17 @@ class PlaylistResponse(BaseModel):
 class CreatePlaylistResponse(BaseModel):
     playlist: PlaylistResponse
     review_queue_items_created: int
+
+
+@router.get("", response_model=list[PlaylistResponse])
+def list_playlists(
+    user: User = Depends(get_default_user),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
+) -> list[PlaylistResponse]:
+    return [
+        PlaylistResponse(id=p.id, name=p.name, description=p.description, rule=p.rule)
+        for p in playlist_repo.list_for_user(user.id)
+    ]
 
 
 @router.post("", response_model=CreatePlaylistResponse, status_code=201)

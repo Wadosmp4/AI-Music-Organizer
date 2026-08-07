@@ -115,6 +115,37 @@ def test_approve_via_http_succeeds_and_calls_music_client(session, api_client, f
     fake_music_client.add_playlist_items.assert_called_once_with("PL123", [library_item.video_id])
 
 
+def test_add_to_playlist_via_http_queues_an_independent_pending_candidate_without_writing(
+    session, api_client, fake_music_client
+):
+    user = _seed_default_user(session)
+    _, library_item, queue_item = _seed_review_queue_item(session, user)
+    other_playlist = Playlist(user_id=user.id, name="Chill", youtube_playlist_id="PL456")
+    session.add(other_playlist)
+    session.commit()
+    session.refresh(other_playlist)
+
+    response = api_client.post(
+        f"/api/v1/review-queue/{queue_item.id}/add-to-playlist",
+        json={"expected_version": 1, "playlist_id": other_playlist.id},
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] != queue_item.id  # a new, independent candidate row
+    assert body["playlist_id"] == other_playlist.id
+    assert body["playlist_name"] == "Chill"
+    assert body["status"] == "pending"
+    fake_music_client.add_playlist_items.assert_not_called()
+
+    # The original suggestion is untouched, still awaiting its own Approve-all.
+    original = api_client.get("/api/v1/review-queue").json()
+    original_item = next(i for i in original if i["id"] == queue_item.id)
+    assert original_item["playlist_id"] == queue_item.playlist_id
+    assert original_item["status"] == "pending"
+
+
 def test_approve_via_http_missing_youtube_link_maps_to_404(session, api_client):
     user = _seed_default_user(session)
     _, _, queue_item = _seed_review_queue_item(session, user, youtube_playlist_id=None)
@@ -415,6 +446,20 @@ def test_onboarding_select_via_http_removes_an_unchecked_already_added_playlist(
 # ---------------------------------------------------------------------------
 # playlists router
 # ---------------------------------------------------------------------------
+
+
+def test_list_playlists_via_http_returns_the_users_playlists(session, api_client):
+    user = _seed_default_user(session)
+    session.add(Playlist(user_id=user.id, name="Rock", description="guitar-driven rock", rule=None))
+    session.commit()
+
+    response = api_client.get("/api/v1/playlists")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body) == 1
+    assert body[0]["name"] == "Rock"
+    assert body[0]["description"] == "guitar-driven rock"
 
 
 def test_create_playlist_via_http_calls_music_client_and_persists_youtube_id(

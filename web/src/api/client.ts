@@ -117,19 +117,29 @@ export function rejectItem(id: number, expectedVersion: number): Promise<ReviewQ
   });
 }
 
-export function moveItem(
+// Never an eager write -- queues the song as a *pending* candidate in
+// `playlistId`'s group, awaiting that group's own Approve-all, exactly like
+// any algorithmic suggestion. An unassigned item's own row is reassigned in
+// place; an already-assigned item gets an independent second pending row
+// (a different id in the response) so both placements are approved
+// separately. See ReviewQueueService.add_to_playlist for the full contract.
+export function addToPlaylist(
   id: number,
   expectedVersion: number,
-  newPlaylistId: number,
+  playlistId: number,
 ): Promise<ReviewQueueItem> {
-  return request<ReviewQueueItem>(`/review-queue/${id}/move`, {
+  return request<ReviewQueueItem>(`/review-queue/${id}/add-to-playlist`, {
     method: "POST",
-    body: JSON.stringify({ expected_version: expectedVersion, new_playlist_id: newPlaylistId }),
+    body: JSON.stringify({ expected_version: expectedVersion, playlist_id: playlistId }),
   });
 }
 
 export function fetchAuthStatus(): Promise<AuthStatus> {
   return request<AuthStatus>("/auth-status");
+}
+
+export function fetchPlaylists(): Promise<AddedPlaylist[]> {
+  return request<AddedPlaylist[]>("/playlists");
 }
 
 export function createPlaylist(

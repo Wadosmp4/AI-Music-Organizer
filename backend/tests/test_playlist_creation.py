@@ -122,7 +122,7 @@ def test_persisted_description_matches_a_later_ingestion_tick(session):
     persisted_playlist = PlaylistRepository(session).get(result.playlist.id)
 
     mock_response = MagicMock()
-    mock_response.choices[0].message.content = '{"matched_playlist": "Late Night Chill"}'
+    mock_response.choices[0].message.content = '{"matched_playlists": ["Late Night Chill"]}'
     with patch("app.services.classification.completion", return_value=mock_response):
         created_count = service.propose_matches(user.id, persisted_playlist)
 
@@ -161,14 +161,16 @@ def test_classify_track_failure_for_one_song_does_not_block_the_rest_of_the_batc
     def _classify(track, candidates, user_id):
         if track["videoId"] == "v-fail":
             raise RuntimeError("classification boom")
-        return ClassificationResult(
-            playlist_id=playlist.id,
-            confidence=0.8,
-            explanation=Explanation("description_match", "matched"),
-            bpm=None,
-            bpm_source=None,
-            genre=None,
-        )
+        return [
+            ClassificationResult(
+                playlist_id=playlist.id,
+                confidence=0.8,
+                explanation=Explanation("description_match", "matched"),
+                bpm=None,
+                bpm_source=None,
+                genre=None,
+            )
+        ]
 
     classification_service = MagicMock(spec=ClassificationService)
     classification_service.classify_track.side_effect = _classify
@@ -216,7 +218,7 @@ def test_rule_gated_existing_playlist_composes_independently_of_new_described_pl
     service = _service(session, classification_service)
 
     mock_response = MagicMock()
-    mock_response.choices[0].message.content = '{"matched_playlist": "Wind Down"}'
+    mock_response.choices[0].message.content = '{"matched_playlists": ["Wind Down"]}'
     with patch("app.services.classification.completion", return_value=mock_response):
         result = service.create_playlist_and_propose_matches(
             user_id=user.id, name="Wind Down", description="slow, relaxing songs"

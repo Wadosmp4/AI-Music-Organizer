@@ -176,17 +176,19 @@ def test_correction_shifts_a_similar_future_song_to_the_corrected_playlist(sessi
     # pre-U7 behavior. Neither playlist has existing-song history, so nothing
     # clears MIN_MATCH_SCORE and there's no description/LLM signal either.
     baseline_service = _service()
-    baseline_result = baseline_service.classify_track(track_b, candidates)
-    assert baseline_result.playlist_id is None
-    assert baseline_result.explanation.signal == "none"
+    baseline_results = baseline_service.classify_track(track_b, candidates)
+    assert len(baseline_results) == 1
+    assert baseline_results[0].playlist_id is None
+    assert baseline_results[0].explanation.signal == "none"
 
     # With the correction-log repo wired in and scoped to this user, the
     # recent correction for the same artist bucket now favors Playlist 2.
     feedback_service = _service(correction_log_repo=CorrectionLogRepository(session))
-    feedback_result = feedback_service.classify_track(track_b, candidates, user_id=user.id)
+    feedback_results = feedback_service.classify_track(track_b, candidates, user_id=user.id)
 
-    assert feedback_result.playlist_id == corrected_playlist.id
-    assert feedback_result.explanation.signal == "correction_feedback"
+    assert len(feedback_results) == 1
+    assert feedback_results[0].playlist_id == corrected_playlist.id
+    assert feedback_results[0].explanation.signal == "correction_feedback"
 
 
 def test_correction_feedback_is_scoped_by_genre_too(session):
@@ -208,10 +210,11 @@ def test_correction_feedback_is_scoped_by_genre_too(session):
     feedback_service = _service(
         genre="synthpop", correction_log_repo=CorrectionLogRepository(session)
     )
-    result = feedback_service.classify_track(track_b, candidates, user_id=user.id)
+    results = feedback_service.classify_track(track_b, candidates, user_id=user.id)
 
-    assert result.playlist_id == corrected_playlist.id
-    assert result.explanation.signal == "correction_feedback"
+    assert len(results) == 1
+    assert results[0].playlist_id == corrected_playlist.id
+    assert results[0].explanation.signal == "correction_feedback"
 
 
 def test_correction_log_repo_none_leaves_behavior_unchanged(session):
@@ -227,15 +230,15 @@ def test_correction_log_repo_none_leaves_behavior_unchanged(session):
     service_with_repo = _service(correction_log_repo=CorrectionLogRepository(session))
 
     track = {"title": "Slow Song", "artists": [{"name": "Artist X"}]}
-    result_without = service_without_repo.classify_track(track, [ruled])
-    result_with = service_with_repo.classify_track(track, [ruled], user_id=user.id)
+    results_without = service_without_repo.classify_track(track, [ruled])
+    results_with = service_with_repo.classify_track(track, [ruled], user_id=user.id)
 
     # Rule rejects (bpm is None here, so bpm_min=150 fails) regardless of the
     # correction-log repo being wired in.
-    assert result_without.playlist_id is None
-    assert result_with.playlist_id is None
-    assert result_without.explanation.signal == "none"
-    assert result_with.explanation.signal == "none"
+    assert results_without[0].playlist_id is None
+    assert results_with[0].playlist_id is None
+    assert results_without[0].explanation.signal == "none"
+    assert results_with[0].explanation.signal == "none"
 
 
 def test_logging_a_correction_does_not_retroactively_touch_an_unrelated_pending_item(session):

@@ -3,9 +3,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
+from app.models.playlist import Playlist
+from app.repositories.playlist_repository import PlaylistRepository
 from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
-from app.services.classification import CandidatePlaylist, ClassificationService
+from app.services.classification import (
+    CandidatePlaylist,
+    ClassificationService,
+    build_artist_counts,
+    build_candidate,
+)
 from app.services.genre_lookup import GenreLookupService
 
 
@@ -32,10 +40,11 @@ def test_every_suggestion_carries_a_confidence_score():
     playlist = CandidatePlaylist(id=1, name="Rock", rule=None, description=None, artist_counts={"queen": 5})
     service = _service()
 
-    result = service.classify_track({"title": "Bohemian Rhapsody", "artists": [{"name": "Queen"}]}, [playlist])
+    results = service.classify_track({"title": "Bohemian Rhapsody", "artists": [{"name": "Queen"}]}, [playlist])
 
-    assert isinstance(result.confidence, float)
-    assert 0.0 <= result.confidence <= 1.0
+    assert len(results) == 1
+    assert isinstance(results[0].confidence, float)
+    assert 0.0 <= results[0].confidence <= 1.0
 
 
 def test_bpm_lookup_hit_returns_measured_value():
@@ -131,22 +140,24 @@ def test_rule_gated_playlist_ignores_description_only_match():
     )
     service = _service(bpm_result=BpmLookupResult(bpm=90.0, source="measured"))
 
-    result = service.classify_track({"title": "Slow Song", "artists": [{"name": "Someone"}]}, [ruled])
+    results = service.classify_track({"title": "Slow Song", "artists": [{"name": "Someone"}]}, [ruled])
 
     # The rule (bpm_min=150) rejects this 90bpm song outright; its description
     # ("chill background music") must not be used to route it there anyway (KTD10).
-    assert result.playlist_id is None
-    assert result.explanation.signal == "none"
+    assert len(results) == 1
+    assert results[0].playlist_id is None
+    assert results[0].explanation.signal == "none"
 
 
 def test_explanation_names_the_rule_signal():
     ruled = CandidatePlaylist(id=1, name="Rock Only", rule={"genre": "rock"}, description=None, artist_counts={})
     service = _service(genre="rock")
 
-    result = service.classify_track({"title": "Song", "artists": [{"name": "Band"}]}, [ruled])
+    results = service.classify_track({"title": "Song", "artists": [{"name": "Band"}]}, [ruled])
 
-    assert result.explanation.signal == "rule"
-    assert "Rock Only" in result.explanation.detail
+    assert len(results) == 1
+    assert results[0].explanation.signal == "rule"
+    assert "Rock Only" in results[0].explanation.detail
 
 
 def test_explanation_names_the_artist_similarity_signal():
@@ -155,10 +166,11 @@ def test_explanation_names_the_artist_similarity_signal():
     )
     service = _service()
 
-    result = service.classify_track({"title": "Song", "artists": [{"name": "Queen"}]}, [playlist])
+    results = service.classify_track({"title": "Song", "artists": [{"name": "Queen"}]}, [playlist])
 
-    assert result.explanation.signal == "artist_similarity"
-    assert "Queen Hits" in result.explanation.detail
+    assert len(results) == 1
+    assert results[0].explanation.signal == "artist_similarity"
+    assert "Queen Hits" in results[0].explanation.detail
 
 
 def test_single_song_llm_failure_does_not_raise_and_falls_through():
@@ -175,15 +187,26 @@ def test_single_song_llm_failure_does_not_raise_and_falls_through():
     with patch(
         "app.services.classification.call_with_retry", side_effect=RuntimeError("timeout")
     ):
-        result = service.classify_track({"title": "Song", "artists": [{"name": "Nobody"}]}, [playlist])
+        results = service.classify_track({"title": "Song", "artists": [{"name": "Nobody"}]}, [playlist])
 
-    assert result.playlist_id is None
-    assert result.explanation.signal == "none"
+    assert len(results) == 1
+    assert results[0].playlist_id is None
+    assert results[0].explanation.signal == "none"
 
     # A second, independent call still proceeds normally — one song's failure
-    # doesn't leave the service or health store in a state that blocks the next.
-    second_result = service.classify_track({"title": "Other Song", "artists": [{"name": "Nobody"}]}, [playlist])
-    assert second_result.explanation.signal == "none"
+    # doesn't leave the service or health store in a state that blocks the
+    # next. Explicitly mocked (not left to hit a real LLM): completion()
+    # never receives self.openrouter_api_key at all -- litellm resolves
+    # credentials from the process environment -- so an unmocked call here
+    # would silently hit a real API using whatever key happens to be in the
+    # shell's environment instead of exercising this test's own fixture.
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = '{"matched_playlists": []}'
+    with patch("app.services.classification.completion", return_value=mock_response):
+        second_results = service.classify_track(
+            {"title": "Other Song", "artists": [{"name": "Nobody"}]}, [playlist]
+        )
+    assert second_results[0].explanation.signal == "none"
 
 
 def test_golden_set_artist_similarity_routes_to_existing_themed_playlist():
@@ -198,16 +221,16 @@ def test_golden_set_artist_similarity_routes_to_existing_themed_playlist():
     )
     service = _service()
 
-    aurora_result = service.classify_track(
+    aurora_results = service.classify_track(
         {"title": "Runaway", "artists": [{"name": "AURORA"}]}, [aurora_playlist, aot_playlist]
     )
-    aot_result = service.classify_track(
+    aot_results = service.classify_track(
         {"title": "Guren no Yumiya", "artists": [{"name": "Linked Horizon"}]},
         [aurora_playlist, aot_playlist],
     )
 
-    assert aurora_result.playlist_id == 1
-    assert aot_result.playlist_id == 2
+    assert [r.playlist_id for r in aurora_results] == [1]
+    assert [r.playlist_id for r in aot_results] == [2]
 
 
 def test_genre_lookup_caches_to_the_database_not_a_file(session):
@@ -240,3 +263,194 @@ def test_genre_lookup_tripped_circuit_breaker_is_distinguishable_from_genuine_mi
     status, reason = dependency_health_store.get_status("lastfm")
     assert status == DependencyStatus.DEGRADED
     assert "circuit" in reason.lower()
+
+
+def _playlist(playlist_id=1, youtube_playlist_id="yt-1"):
+    return Playlist(
+        id=playlist_id,
+        user_id=1,
+        name="Existing",
+        description=None,
+        rule=None,
+        youtube_playlist_id=youtube_playlist_id,
+    )
+
+
+def test_build_artist_counts_tallies_the_playlists_real_youtube_content():
+    music_client = MagicMock(spec=MusicServiceClient)
+    music_client.get_playlist_tracks.return_value = [
+        {"videoId": "v1", "title": "Song A", "artists": [{"name": "Daft Punk"}]},
+        {"videoId": "v2", "title": "Song B", "artists": [{"name": "Daft Punk"}]},
+        {"videoId": "v3", "title": "Song C", "artists": [{"name": "Justice"}]},
+    ]
+
+    counts = build_artist_counts(music_client, _playlist())
+
+    assert counts == {"daftpunk": 2, "justice": 1}
+    music_client.get_playlist_tracks.assert_called_once_with("yt-1")
+
+
+def test_build_artist_counts_is_empty_for_a_playlist_with_no_youtube_id():
+    music_client = MagicMock(spec=MusicServiceClient)
+
+    counts = build_artist_counts(music_client, _playlist(youtube_playlist_id=None))
+
+    assert counts == {}
+    music_client.get_playlist_tracks.assert_not_called()
+
+
+def test_build_artist_counts_degrades_to_empty_on_fetch_failure():
+    """KTD18: one playlist's fetch problem must not block classification
+    against every other candidate."""
+    music_client = MagicMock(spec=MusicServiceClient)
+    music_client.get_playlist_tracks.side_effect = RuntimeError("needs reconnect")
+
+    counts = build_artist_counts(music_client, _playlist())
+
+    assert counts == {}
+
+
+def test_a_song_can_match_more_than_one_playlist_at_once():
+    """The user's own framing: a song isn't limited to one playlist. An
+    artist repeating in one playlist's history and a genuine vibe/theme fit
+    in a completely different playlist are independent signals -- both
+    playlists should get queued, not just whichever signal "wins"."""
+    artist_playlist = CandidatePlaylist(
+        id=1, name="Old Favorites", rule=None, description=None, artist_counts={"queen": 5}
+    )
+    vibe_playlist = CandidatePlaylist(
+        id=2, name="Arena Rock Anthems", rule=None, description="stadium rock anthems", artist_counts={}
+    )
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    genre_lookup.genre_for.return_value = None
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = '{"matched_playlists": ["Arena Rock Anthems"]}'
+    with patch("app.services.classification.completion", return_value=mock_response):
+        results = service.classify_track(
+            {"title": "Song", "artists": [{"name": "Queen"}]}, [artist_playlist, vibe_playlist]
+        )
+
+    by_playlist = {r.playlist_id: r for r in results}
+    assert set(by_playlist) == {1, 2}
+    assert by_playlist[1].explanation.signal == "artist_similarity"
+    assert by_playlist[2].explanation.signal == "description_match"
+
+
+def test_a_playlist_matched_via_description_is_not_also_reported_via_artist_similarity():
+    """A playlist that already has real artist history AND a description fit
+    for the same song must appear exactly once in the results, not twice."""
+    playlist = CandidatePlaylist(
+        id=1, name="Arena Rock Anthems", rule=None, description="stadium rock anthems", artist_counts={"queen": 5}
+    )
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    genre_lookup.genre_for.return_value = None
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = '{"matched_playlists": ["Arena Rock Anthems"]}'
+    with patch("app.services.classification.completion", return_value=mock_response):
+        results = service.classify_track({"title": "Song", "artists": [{"name": "Queen"}]}, [playlist])
+
+    assert len(results) == 1
+    assert results[0].explanation.signal == "description_match"
+
+
+def test_generate_vibe_description_summarizes_the_tracks():
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    tracks = [{"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}]
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = "Upbeat French house and electronic tracks."
+    with patch("app.services.classification.completion", return_value=mock_response):
+        description = service.generate_vibe_description(tracks)
+
+    assert description == "Upbeat French house and electronic tracks."
+
+
+def test_generate_vibe_description_is_none_without_an_llm_key_or_tracks():
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    bpm_lookup.openrouter_api_key = None
+    track = {"videoId": "v1", "title": "t", "artists": [{"name": "a"}]}
+
+    no_key_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key=None)
+    assert no_key_service.generate_vibe_description([track]) is None
+
+    keyed_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    assert keyed_service.generate_vibe_description([]) is None
+
+
+def test_build_candidate_backfills_a_missing_description_from_real_playlist_content(session):
+    from app.models.user import User
+
+    user = User(display_name="Test User")
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    playlist_repo = PlaylistRepository(session)
+    playlist = playlist_repo.create(
+        Playlist(
+            user_id=user.id, name="Existing", description=None, rule=None, youtube_playlist_id="yt-1"
+        )
+    )
+    music_client = MagicMock(spec=MusicServiceClient)
+    music_client.get_playlist_tracks.return_value = [
+        {"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}
+    ]
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = "French house vibes."
+    with patch("app.services.classification.completion", return_value=mock_response):
+        candidate = build_candidate(music_client, classification_service, playlist_repo, playlist)
+
+    assert candidate.description == "French house vibes."
+    assert candidate.artist_counts == {"daftpunk": 1}
+    persisted = playlist_repo.get(playlist.id)
+    assert persisted.description == "French house vibes."
+
+
+def test_build_candidate_does_not_overwrite_an_existing_description(session):
+    from app.models.user import User
+
+    user = User(display_name="Test User")
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    playlist_repo = PlaylistRepository(session)
+    playlist = playlist_repo.create(
+        Playlist(
+            user_id=user.id,
+            name="Existing",
+            description="already has a vibe",
+            rule=None,
+            youtube_playlist_id="yt-1",
+        )
+    )
+    music_client = MagicMock(spec=MusicServiceClient)
+    music_client.get_playlist_tracks.return_value = [
+        {"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}
+    ]
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    bpm_lookup = MagicMock(spec=BpmLookupService)
+    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
+    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+
+    with patch("app.services.classification.completion") as mock_completion:
+        candidate = build_candidate(music_client, classification_service, playlist_repo, playlist)
+
+    mock_completion.assert_not_called()
+    assert candidate.description == "already has a vibe"

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  addToPlaylist,
   approveItem,
   checkForNewSongs,
   fetchAuthStatus,
+  fetchPlaylists,
   fetchReviewQueue,
-  moveItem,
   rejectItem,
   resetBacklog,
+  type AddedPlaylist,
   type AuthStatus,
   type ReviewQueueItem,
 } from "../api/client";
@@ -53,33 +55,28 @@ function ConfidenceBadge({ confidence }: { confidence: number | null }) {
 
 const PILL_BUTTON = "rounded-full px-3 py-1 text-sm font-medium transition-colors";
 
-// The drag payload's mime type -- a plain string key, not a real media type,
-// but "text/plain" is the one type every browser reliably carries through a
-// same-page HTML5 drag/drop without extra permissions.
-const DRAG_MIME_TYPE = "text/plain";
-
-interface DragPayload {
-  id: number;
-  version: number;
-}
-
 export function ReviewQueue() {
   const [items, setItems] = useState<ReviewQueueItem[]>([]);
+  const [playlists, setPlaylists] = useState<AddedPlaylist[]>([]);
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [checkMessage, setCheckMessage] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
-  const [dragOverPlaylistId, setDragOverPlaylistId] = useState<number | null>(null);
   const mountedRef = useRef(true);
 
   async function loadQueue() {
     try {
-      const [queue, status] = await Promise.all([fetchReviewQueue(), fetchAuthStatus()]);
+      const [queue, status, playlistList] = await Promise.all([
+        fetchReviewQueue(),
+        fetchAuthStatus(),
+        fetchPlaylists(),
+      ]);
       if (!mountedRef.current) return;
       setItems(queue.filter((item) => item.status === "pending"));
       setAuthStatus(status);
+      setPlaylists(playlistList);
     } catch (err) {
       if (!mountedRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
@@ -155,23 +152,39 @@ export function ReviewQueue() {
     setItems((prev) => prev.filter((i) => i.id !== item.id));
   }
 
-  async function handleMove(id: number, version: number, newPlaylistId: number) {
-    await moveItem(id, version, newPlaylistId);
-    setItems((prev) => prev.filter((i) => i.id !== id));
-  }
-
-  function handleDropOnPlaylist(event: React.DragEvent, playlistId: number) {
-    event.preventDefault();
-    setDragOverPlaylistId(null);
-    const raw = event.dataTransfer.getData(DRAG_MIME_TYPE);
-    if (!raw) return;
-    const { id, version } = JSON.parse(raw) as DragPayload;
-    const dragged = items.find((item) => item.id === id);
-    if (!dragged || dragged.playlist_id === playlistId) return;
-    void handleMove(id, version, playlistId);
+  // Never an eager write -- the song is only ever queued as a pending
+  // candidate in the target playlist's group, awaiting that group's own
+  // Approve-all (mirrors ReviewQueueService.add_to_playlist). An unassigned
+  // item's own row is reassigned in place (same id back); an already-placed
+  // item gets an independent second pending row (a different id), which is
+  // added to the list alongside the untouched original.
+  async function handleAddToPlaylist(item: ReviewQueueItem, targetPlaylistId: number, targetName: string) {
+    const result = await addToPlaylist(item.id, item.version, targetPlaylistId);
+    if (!mountedRef.current) return;
+    if (result.id === item.id) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? result : i)));
+    } else {
+      setItems((prev) => [...prev, result]);
+    }
+    setCheckMessage(`Added "${item.title}" to ${targetName} — awaiting its own approval.`);
   }
 
   const groups = useMemo(() => groupByPlaylist(items), [items]);
+
+  // A song already has a pending/approved candidate in these playlists (its
+  // original suggestion plus any manual adds) -- offering them again in its
+  // own "Add to playlist" dropdown would just create a same-song duplicate
+  // the backend would silently collapse anyway (see add_to_playlist).
+  const claimedPlaylistIdsByLibraryItem = useMemo(() => {
+    const map = new Map<number, Set<number>>();
+    for (const it of items) {
+      if (it.playlist_id === null) continue;
+      const claimed = map.get(it.library_item_id) ?? new Set<number>();
+      claimed.add(it.playlist_id);
+      map.set(it.library_item_id, claimed);
+    }
+    return map;
+  }, [items]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -215,25 +228,7 @@ export function ReviewQueue() {
       {[...groups.entries()].map(([playlistId, groupItems]) => (
         <section
           key={playlistId ?? "unassigned"}
-          onDragOver={(event) => {
-            if (playlistId === null) return;
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "move";
-          }}
-          onDragEnter={() => {
-            if (playlistId !== null) setDragOverPlaylistId(playlistId);
-          }}
-          onDragLeave={() => {
-            if (playlistId !== null) setDragOverPlaylistId((prev) => (prev === playlistId ? null : prev));
-          }}
-          onDrop={(event) => {
-            if (playlistId !== null) handleDropOnPlaylist(event, playlistId);
-          }}
-          className={`rounded-2xl border bg-white shadow-sm transition-colors ${
-            dragOverPlaylistId === playlistId && playlistId !== null
-              ? "border-accent bg-indigo-50"
-              : "border-slate-200"
-          }`}
+          className="rounded-2xl border border-slate-200 bg-white shadow-sm"
         >
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
             <h2 className="text-sm font-semibold text-slate-700">
@@ -253,15 +248,7 @@ export function ReviewQueue() {
               <li
                 key={item.id}
                 data-testid={`queue-item-${item.id}`}
-                draggable
-                onDragStart={(event) => {
-                  event.dataTransfer.effectAllowed = "move";
-                  event.dataTransfer.setData(
-                    DRAG_MIME_TYPE,
-                    JSON.stringify({ id: item.id, version: item.version } satisfies DragPayload),
-                  );
-                }}
-                className="flex cursor-grab flex-col gap-2 px-5 py-4 active:cursor-grabbing"
+                className="flex flex-col gap-2 px-5 py-4"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -279,13 +266,32 @@ export function ReviewQueue() {
                   </div>
                 )}
                 {item.explanation?.bpm_source === "measured" && <BpmAttribution />}
-                <div className="flex gap-2 pt-1">
+                <div className="flex items-center gap-2 pt-1">
                   <button
                     onClick={() => void handleReject(item)}
                     className={`${PILL_BUTTON} bg-rose-100 text-rose-700 hover:bg-rose-200`}
                   >
                     Reject
                   </button>
+                  <select
+                    aria-label={`Add "${item.title}" to a playlist`}
+                    value=""
+                    onChange={(event) => {
+                      const targetId = Number(event.target.value);
+                      const target = playlists.find((p) => p.id === targetId);
+                      if (target) void handleAddToPlaylist(item, target.id, target.name);
+                    }}
+                    className="rounded-full border border-slate-200 bg-white px-3 py-1 text-sm font-medium text-slate-700 hover:border-slate-300"
+                  >
+                    <option value="">+ Add to playlist</option>
+                    {playlists
+                      .filter((p) => !claimedPlaylistIdsByLibraryItem.get(item.library_item_id)?.has(p.id))
+                      .map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                  </select>
                 </div>
               </li>
             ))}

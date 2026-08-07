@@ -17,7 +17,7 @@ from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
-from app.services.classification import CandidatePlaylist, ClassificationService
+from app.services.classification import CandidatePlaylist, ClassificationService, build_candidate
 from app.services.unplaced import unplaced_library_items
 
 
@@ -84,12 +84,17 @@ class PlaylistCreationService:
         for item in library_items:
             track = track_from_library_item(item)
             try:
-                result = self.classification_service.classify_track(track, candidates, user_id=user_id)
+                results = self.classification_service.classify_track(track, candidates, user_id=user_id)
             except Exception:
                 # KTD18: one song's failure must not block the rest of this
                 # batch, mirroring jobs/ingestion.py's identical guard.
                 continue
-            if result.playlist_id != playlist.id:
+            # classify_track may match this song to several playlists at
+            # once (candidates includes every other playlist too, so a rule
+            # or vibe fit elsewhere can coexist) -- this method only ever
+            # queues it for the one playlist it's scoped to.
+            match = next((r for r in results if r.playlist_id == playlist.id), None)
+            if match is None:
                 continue
 
             self.review_queue_repository.create(
@@ -97,8 +102,8 @@ class PlaylistCreationService:
                     user_id=user_id,
                     library_item_id=item.id,
                     playlist_id=playlist.id,
-                    confidence=result.confidence,
-                    explanation=result.as_explanation_dict(),
+                    confidence=match.confidence,
+                    explanation=match.as_explanation_dict(),
                 )
             )
             created_count += 1
@@ -107,16 +112,18 @@ class PlaylistCreationService:
     def _build_candidates(self, user_id: int, playlist: Playlist) -> list[CandidatePlaylist]:
         """The classify_track candidate set: this playlist plus the user's other
         playlists, so an existing playlist's rule (KTD10 hard gate) still takes
-        precedence over this one's description where it should. Artist-count
-        tracking for *other* pre-existing playlists' contents isn't wired up by
-        this unit — that's a future ingestion-tick concern — so they're passed
-        with an empty artist_counts; a brand-new playlist has no existing songs
-        either way, so its own artist_counts is always empty.
+        precedence over this one's description where it should. Each
+        playlist's artist_counts reflects its actual current YouTube content,
+        and a missing description is backfilled from that same content
+        (build_candidate); the brand-new `playlist` itself has nothing on
+        YouTube yet, so its own artist_counts is always empty at this point.
         """
         candidates = [
-            CandidatePlaylist.from_playlist(existing)
+            build_candidate(self.music_client, self.classification_service, self.playlist_repository, existing)
             for existing in self.playlist_repository.list_for_user(user_id)
             if existing.id != playlist.id
         ]
-        candidates.append(CandidatePlaylist.from_playlist(playlist))
+        candidates.append(
+            build_candidate(self.music_client, self.classification_service, self.playlist_repository, playlist)
+        )
         return candidates

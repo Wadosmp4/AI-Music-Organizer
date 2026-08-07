@@ -21,7 +21,7 @@ from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
 from app.repositories.user_repository import UserRepository
-from app.services.classification import CandidatePlaylist, ClassificationService
+from app.services.classification import ClassificationService, build_candidate
 
 # Bounded per call so a single request can't burst GetSongBPM's 3,000/hour
 # ceiling (KTD21) — the caller repeats the check until backfill_complete.
@@ -112,13 +112,14 @@ def run_ingestion_check(
     new_songs = all_new_songs[:limit]
 
     candidates = [
-        CandidatePlaylist.from_playlist(p) for p in playlist_repository.list_for_user(user_id)
+        build_candidate(music_client, classification_service, playlist_repository, p)
+        for p in playlist_repository.list_for_user(user_id)
     ]
 
     queue_items_created = 0
     for song in new_songs:
         try:
-            result = classification_service.classify_track(song, candidates, user_id=user_id)
+            results = classification_service.classify_track(song, candidates, user_id=user_id)
         except Exception:
             # KTD18: this song's failure never blocks the rest of the check.
             # The LibraryItem row is deliberately NOT created here — creating
@@ -137,22 +138,25 @@ def run_ingestion_check(
             )
         )
 
-        # A queue item is created even with no playlist match (playlist_id
-        # None) -- otherwise an unmatched song is a LibraryItem with no
+        # One queue item per matched playlist -- a song can belong to more
+        # than one -- or a single unassigned one when `results` is the
+        # "no match" placeholder (playlist_id=None). Either way, an unmatched
+        # song still gets a row: otherwise it's a LibraryItem with no
         # review_queue row at all, invisible everywhere and impossible to
         # ever manually assign to a playlist. It surfaces in the Review
-        # Queue's "Unassigned" group instead, where it can be dragged onto
-        # a playlist like any other item.
-        review_queue_repository.create(
-            ReviewQueueItem(
-                user_id=user_id,
-                library_item_id=library_item.id,
-                playlist_id=result.playlist_id,
-                confidence=result.confidence,
-                explanation=result.as_explanation_dict(),
+        # Queue's "Unassigned" group instead, where it can be added to a
+        # playlist like any other item.
+        for result in results:
+            review_queue_repository.create(
+                ReviewQueueItem(
+                    user_id=user_id,
+                    library_item_id=library_item.id,
+                    playlist_id=result.playlist_id,
+                    confidence=result.confidence,
+                    explanation=result.as_explanation_dict(),
+                )
             )
-        )
-        queue_items_created += 1
+            queue_items_created += 1
 
     backfill_complete = False
     if is_backfill and len(all_new_songs) <= limit:

@@ -36,6 +36,11 @@ class MoveRequest(BaseModel):
     new_playlist_id: int
 
 
+class AddToPlaylistRequest(BaseModel):
+    expected_version: int
+    playlist_id: int
+
+
 class ReviewQueueItemResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -135,6 +140,26 @@ def move(
     try:
         return _to_response(
             service.move(item_id, body.expected_version, body.new_playlist_id),
+            library_repo,
+            playlist_repo,
+        )
+    except _DOMAIN_EXCEPTIONS:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"write failed: {exc}")
+
+
+@router.post("/{item_id}/add-to-playlist", response_model=ReviewQueueItemResponse)
+def add_to_playlist(
+    item_id: int,
+    body: AddToPlaylistRequest,
+    service: ReviewQueueService = Depends(get_review_queue_service),
+    library_repo: LibraryRepository = Depends(get_library_repository),
+    playlist_repo: PlaylistRepository = Depends(get_playlist_repository),
+):
+    try:
+        return _to_response(
+            service.add_to_playlist(item_id, body.expected_version, body.playlist_id),
             library_repo,
             playlist_repo,
         )

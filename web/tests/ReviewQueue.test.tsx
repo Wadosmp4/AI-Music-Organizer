@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,19 +6,6 @@ import * as client from "../src/api/client";
 import { ReviewQueue } from "../src/pages/ReviewQueue";
 
 vi.mock("../src/api/client");
-
-// jsdom's DataTransfer doesn't persist data between dispatched events, so
-// tests carry their own in-memory store matching the real setData/getData
-// contract the component relies on.
-function makeDataTransfer() {
-  const store = new Map<string, string>();
-  return {
-    setData: (type: string, value: string) => store.set(type, value),
-    getData: (type: string) => store.get(type) ?? "",
-    dropEffect: "move",
-    effectAllowed: "move",
-  } as unknown as DataTransfer;
-}
 
 const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
@@ -49,6 +36,7 @@ function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.Revie
 
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.mocked(client.fetchPlaylists).mockResolvedValue([]);
 });
 
 describe("ReviewQueue", () => {
@@ -158,51 +146,88 @@ describe("ReviewQueue", () => {
     expect(client.rejectItem).toHaveBeenCalledWith(1, 1);
   });
 
-  it("moves a song to another playlist by dragging it onto that playlist's section", async () => {
-    const dragged = makeItem({ id: 1, playlist_id: 10 });
-    const other = makeItem({
-      id: 2,
-      library_item_id: 2,
-      playlist_id: 20,
-      title: "Other Song",
-    });
-    vi.mocked(client.fetchReviewQueue).mockResolvedValue([dragged, other]);
-    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-    vi.mocked(client.moveItem).mockResolvedValue({ ...dragged, status: "moved", playlist_id: 20 });
-
-    render(<ReviewQueue />);
-    await screen.findByTestId("queue-item-1");
-
-    const dataTransfer = makeDataTransfer();
-    const draggedRow = screen.getByTestId("queue-item-1");
-    const targetSection = screen.getByTestId("queue-item-2").closest("section")!;
-
-    fireEvent.dragStart(draggedRow, { dataTransfer });
-    fireEvent.drop(targetSection, { dataTransfer });
-
-    await waitFor(() => {
-      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
-    });
-    expect(client.moveItem).toHaveBeenCalledWith(1, 1, 20);
-  });
-
-  it("does not call moveItem when dropping a song onto its own playlist", async () => {
-    const item = makeItem({ id: 1, playlist_id: 10 });
+  it("moves an unassigned song into the chosen playlist's group, still pending approval", async () => {
+    const item = makeItem({ id: 1, playlist_id: null, playlist_name: null });
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchPlaylists).mockResolvedValue([
+      { id: 20, name: "Chill", description: null, rule: null },
+    ]);
+    // Same id back -- a reassignment of the existing row, not a new one.
+    vi.mocked(client.addToPlaylist).mockResolvedValue({
+      ...item,
+      playlist_id: 20,
+      playlist_name: "Chill",
+      status: "pending",
+    });
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+    expect(screen.getByText("Unassigned")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText('Add "Test Song" to a playlist'), "20");
+
+    expect(client.addToPlaylist).toHaveBeenCalledWith(1, 1, 20);
+    await waitFor(() => {
+      expect(screen.getByText("Chill")).toBeInTheDocument();
+    });
+    // No eager write -- it's just re-grouped, still visible and pending.
+    expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
+    expect(screen.queryByText("Unassigned")).not.toBeInTheDocument();
+  });
+
+  it("adds an independent pending candidate for an already-assigned song without touching the original", async () => {
+    const item = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock", library_item_id: 1 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchPlaylists).mockResolvedValue([
+      { id: 10, name: "Rock", description: null, rule: null },
+      { id: 20, name: "Chill", description: null, rule: null },
+    ]);
+    // A different id -- an independent second candidate row.
+    vi.mocked(client.addToPlaylist).mockResolvedValue({
+      ...item,
+      id: 2,
+      playlist_id: 20,
+      playlist_name: "Chill",
+    });
 
     render(<ReviewQueue />);
     await screen.findByTestId("queue-item-1");
 
-    const dataTransfer = makeDataTransfer();
-    const row = screen.getByTestId("queue-item-1");
-    const section = row.closest("section")!;
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText('Add "Test Song" to a playlist'), "20");
 
-    fireEvent.dragStart(row, { dataTransfer });
-    fireEvent.drop(section, { dataTransfer });
-
-    expect(client.moveItem).not.toHaveBeenCalled();
+    expect(client.addToPlaylist).toHaveBeenCalledWith(1, 1, 20);
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        'Added "Test Song" to Chill — awaiting its own approval.',
+      );
+    });
+    // Both the original (still under Rock) and the new candidate (under
+    // Chill) are visible -- neither was written or removed.
     expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
+    expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+    expect(screen.getByText("Rock")).toBeInTheDocument();
+    expect(screen.getByText("Chill")).toBeInTheDocument();
+  });
+
+  it("does not offer a song's own playlist as an add-to-playlist option", async () => {
+    const item = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchPlaylists).mockResolvedValue([
+      { id: 10, name: "Rock", description: null, rule: null },
+      { id: 20, name: "Chill", description: null, rule: null },
+    ]);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    const select = screen.getByLabelText('Add "Test Song" to a playlist');
+    expect(screen.queryByRole("option", { name: "Rock" })).not.toBeInTheDocument();
+    expect(select).toHaveTextContent("Chill");
   });
 
   it("loads the next batch of songs and shows the result message", async () => {

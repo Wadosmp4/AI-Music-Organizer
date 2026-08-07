@@ -20,6 +20,13 @@ class PlaylistRepository:
         self.session.delete(playlist)
         self.session.commit()
 
+    def update_description(self, playlist_id: int, description: str) -> Optional[Playlist]:
+        playlist = self.get(playlist_id)
+        if playlist is None:
+            return None
+        playlist.description = description
+        return save(self.session, playlist)
+
     def list_for_user(self, user_id: int) -> list[Playlist]:
         return list(
             self.session.exec(select(Playlist).where(Playlist.user_id == user_id))

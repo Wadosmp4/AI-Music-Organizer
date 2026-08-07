@@ -255,3 +255,86 @@ def test_stale_item_surfaced_synchronously_rather_than_approvable(session, seede
     music_client.add_playlist_items.assert_not_called()
     refreshed = service.review_queue_repo.get(seeded["queue_item"].id)
     assert refreshed.status == "stale"
+
+
+def test_add_to_playlist_on_unassigned_item_reassigns_without_writing(session):
+    """Never an eager write (unlike move): this is a pending first-placement
+    decision, not a commit -- it still waits for that playlist's Approve-all."""
+    user = User(display_name="Test User")
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    playlist = Playlist(user_id=user.id, name="Rock", youtube_playlist_id="PL123")
+    session.add(playlist)
+    session.commit()
+    session.refresh(playlist)
+    library_item = LibraryItem(user_id=user.id, video_id="vid1", title="Song", artist="Artist")
+    session.add(library_item)
+    session.commit()
+    session.refresh(library_item)
+    queue_item = ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=None)
+    session.add(queue_item)
+    session.commit()
+    session.refresh(queue_item)
+
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.add_to_playlist(queue_item.id, expected_version=1, target_playlist_id=playlist.id)
+
+    assert result.id == queue_item.id
+    assert result.status == "pending"
+    assert result.playlist_id == playlist.id
+    music_client.add_playlist_items.assert_not_called()
+
+
+def test_add_to_playlist_on_an_already_assigned_item_creates_an_independent_pending_candidate(
+    session, seeded
+):
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.add_to_playlist(
+        seeded["queue_item"].id, expected_version=1, target_playlist_id=seeded["other_playlist"].id
+    )
+
+    # A brand new row -- the original suggestion is completely untouched, so
+    # each placement is approved (and written) independently later.
+    assert result.id != seeded["queue_item"].id
+    assert result.playlist_id == seeded["other_playlist"].id
+    assert result.status == "pending"
+    original = service.review_queue_repo.get(seeded["queue_item"].id)
+    assert original.playlist_id == seeded["playlist"].id
+    assert original.status == "pending"
+    music_client.add_playlist_items.assert_not_called()
+    assert service.correction_log_repo.list_for_user(seeded["user"].id) == []
+
+
+def test_add_to_playlist_does_not_duplicate_an_already_active_candidate(session, seeded):
+    """Clicking "Add to X" twice (or X already holding this song's original
+    suggestion) must not create two pending rows for the same song/playlist."""
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    first = service.add_to_playlist(
+        seeded["queue_item"].id, expected_version=1, target_playlist_id=seeded["other_playlist"].id
+    )
+    second = service.add_to_playlist(
+        seeded["queue_item"].id, expected_version=1, target_playlist_id=seeded["other_playlist"].id
+    )
+
+    assert second.id == first.id
+    all_items = service.review_queue_repo.list_for_user(seeded["user"].id)
+    assert len(all_items) == 2  # original + the one new candidate, not three
+
+
+def test_add_to_playlist_targeting_the_items_current_playlist_is_a_noop(session, seeded):
+    music_client = MagicMock()
+    service = _service(session, music_client)
+
+    result = service.add_to_playlist(
+        seeded["queue_item"].id, expected_version=1, target_playlist_id=seeded["playlist"].id
+    )
+
+    assert result.id == seeded["queue_item"].id
+    music_client.add_playlist_items.assert_not_called()

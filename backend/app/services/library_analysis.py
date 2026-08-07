@@ -1,13 +1,17 @@
 """Onboarding library analysis and new-playlist selection (U9, F5, R7).
 
-Distinct from U3's per-song classification hot path: this batches the
-*entire* unplaced backlog through the LLM at once (ported from
+Distinct from U3's per-song classification hot path: this batches *every*
+library item pulled in so far through the LLM at once (ported from
 organize_music.py's suggest_playlists) to find clusters of thematically
 related songs worth proposing as brand-new playlists — name, theme, and an
-estimated song count only. No songs are attached and no review_queue items
-are created here (R8) — that's U4's backfill, which this unit deliberately
-gates: only after the user's selection completes does onboarding_completed_at
-get set, which U4 checks before it starts classifying (F5 step 4).
+estimated song count only. Deliberately not limited to still-unplaced songs:
+a song can already fit an existing playlist and still belong in a newly
+proposed one too (multi-label matching means accepting a new proposal never
+removes it from where it already landed). No songs are attached and no
+review_queue items are created here (R8) — that's U4's backfill, which this
+unit deliberately gates: only after the user's selection completes does
+onboarding_completed_at get set, which U4 checks before it starts classifying
+(F5 step 4).
 """
 
 from dataclasses import dataclass
@@ -26,7 +30,6 @@ from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
 from app.services.genre_lookup import GenreLookupService
-from app.services.unplaced import unplaced_library_items
 
 litellm.suppress_debug_info = True
 
@@ -43,6 +46,13 @@ your own knowledge of these artists/songs — genre, mood, era, or language. The
 genre tag is only a hint; it may be missing or wrong.
 
 Rules:
+- Cluster by genre, mood, or theme, never by artist identity. A good playlist
+  spans multiple different artists that share a real musical throughline —
+  it is not just "everything by this one artist."
+- Do not propose a playlist whose songs are all by the same single artist
+  unless every one of those songs plainly has no other thematic home. Prefer
+  merging a small same-artist group into a broader genre/mood cluster with
+  other artists over proposing it as its own playlist.
 - Only propose a playlist for a group of at least 4 clearly related songs.
 - Give each playlist a short, human-friendly name (e.g. "90s R&B", "Ukrainian Rock", "Chill Electronic").
 - Give each playlist a one-sentence theme description a listener could recognize the vibe from.
@@ -76,6 +86,23 @@ def _format_tracks(tracks: list[dict]) -> str:
         genre = f" [{t['genre']}]" if t.get("genre") else ""
         lines.append(f"{i}: {t['artist']} - {t['title']}{genre}")
     return "\n".join(lines)
+
+
+def _format_existing_playlists_context(playlists: list[Playlist]) -> str:
+    """Shows the LLM the genre/mood granularity this user already organizes
+    by (e.g. "EDM mix", "Cardio", "Classic") so new proposals match that
+    style instead of degrading to a same-artist bin when a song's genre tag
+    is missing or too generic to group on its own."""
+    described = [p for p in playlists if p.description]
+    if not described:
+        return ""
+    lines = [f"- {p.name}: {p.description}" for p in described]
+    return (
+        "This user already organizes their library into playlists like these "
+        "(genre/mood-based, spanning many artists each) — match this style and "
+        "granularity for any new proposals rather than grouping by artist:\n"
+        + "\n".join(lines)
+    )
 
 
 class LibraryAnalysisService:
@@ -125,10 +152,9 @@ class LibraryAnalysisService:
         if not self.openrouter_api_key:
             return []
 
-        unplaced = unplaced_library_items(
-            user_id, self.library_repository, self.review_queue_repository
-        )
-        if not unplaced:
+        library_items = self.library_repository.list_for_user(user_id)
+        library_items = [item for item in library_items if item.removed_at is None]
+        if not library_items:
             return []
 
         enriched = [
@@ -138,13 +164,16 @@ class LibraryAnalysisService:
                 "artist": item.artist,
                 "genre": self.genre_lookup.genre_for(item.artist) if self.genre_lookup else None,
             }
-            for item in unplaced
+            for item in library_items
         ]
+        existing_context = _format_existing_playlists_context(
+            self.playlist_repository.list_for_user(user_id)
+        )
 
         merged: dict[str, dict] = {}
         for i in range(0, len(enriched), BATCH_SIZE):
             batch = enriched[i : i + BATCH_SIZE]
-            for suggestion in self._cluster_batch(batch):
+            for suggestion in self._cluster_batch(batch, existing_context):
                 key = suggestion["name"].strip().lower()
                 if key in merged:
                     merged[key]["count"] += suggestion["count"]
@@ -162,15 +191,18 @@ class LibraryAnalysisService:
             if s["count"] >= MIN_CLUSTER_SIZE
         ]
 
-    def _cluster_batch(self, batch: list[dict]) -> list[dict]:
+    def _cluster_batch(self, batch: list[dict], existing_context: str = "") -> list[dict]:
         schema = _PlaylistSuggestions.model_json_schema()
+        user_content = _format_tracks(batch)
+        if existing_context:
+            user_content = f"{existing_context}\n\n{user_content}"
 
         def _call():
             return completion(
                 model=CLUSTERING_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": _format_tracks(batch)},
+                    {"role": "user", "content": user_content},
                 ],
                 response_format={
                     "type": "json_schema",

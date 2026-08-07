@@ -135,6 +135,109 @@ def test_cluster_batch_empty_choices_list_surfaces_degraded_health_instead_of_ra
     assert "clustering" in reason.lower()
 
 
+def test_clustering_considers_songs_already_matched_to_an_existing_playlist(session):
+    """Suggestions previously only looked at still-unplaced songs, so once a
+    song matched an existing playlist it could never surface in a new-
+    playlist proposal — even though multi-label matching means accepting a
+    new proposal wouldn't remove it from where it already landed. Now the
+    full accumulated library feeds clustering, not just the leftovers."""
+    user = _make_user(session)
+    playlist = PlaylistRepository(session).create(
+        Playlist(user_id=user.id, name="Existing", description="some existing playlist", rule=None)
+    )
+    items = _add_library_items(
+        session,
+        user.id,
+        [
+            ("v1", "Song 1", "Artist A"),
+            ("v2", "Song 2", "Artist B"),
+            ("v3", "Song 3", "Artist C"),
+            ("v4", "Song 4", "Artist D"),
+        ],
+    )
+    # Song 1 already matched "Existing" and is sitting pending review there —
+    # a settled placement, but not a reason to exclude it from clustering.
+    ReviewQueueRepository(session).create(
+        ReviewQueueItem(user_id=user.id, library_item_id=items[0].id, playlist_id=playlist.id)
+    )
+    service = _service(session)
+
+    mock_response = _mock_cluster_response("Chill Electronic", "Laid-back electronic songs", [0, 1, 2, 3])
+    with patch("app.services.library_analysis.completion", return_value=mock_response):
+        proposals = service.propose_new_playlists(user.id)
+
+    assert len(proposals) == 1
+    assert proposals[0].song_count == 4
+
+
+def test_clustering_excludes_removed_songs_no_longer_in_the_library(session):
+    user = _make_user(session)
+    items = _add_library_items(
+        session,
+        user.id,
+        [
+            ("v1", "Song 1", "Artist A"),
+            ("v2", "Song 2", "Artist B"),
+            ("v3", "Song 3", "Artist C"),
+            ("v4", "Song 4", "Artist D"),
+        ],
+    )
+    LibraryRepository(session).mark_removed(items[0].id)
+    service = _service(session)
+
+    mock_response = _mock_cluster_response("Chill Electronic", "Laid-back electronic songs", [0, 1, 2])
+    with patch("app.services.library_analysis.completion", return_value=mock_response) as mock_completion:
+        proposals = service.propose_new_playlists(user.id)
+
+    _, kwargs = mock_completion.call_args
+    user_message = kwargs["messages"][1]["content"]
+    assert "Song 1" not in user_message
+    assert proposals == []  # only 3 remaining songs, below MIN_CLUSTER_SIZE
+
+
+def test_existing_playlist_style_is_passed_as_context_to_the_clustering_prompt(session):
+    """Clustering previously only saw artist/title/genre per song, which left
+    it defaulting to same-artist bins when the genre tag was missing or too
+    generic to differentiate. Passing the user's own already-added playlist
+    names/descriptions calibrates the LLM toward the genre/mood-spanning-
+    multiple-artists style the user already organizes by."""
+    user = _make_user(session)
+    PlaylistRepository(session).create(
+        Playlist(
+            user_id=user.id,
+            name="EDM mix",
+            description="High-energy electronic dance music and remixes.",
+            rule=None,
+        )
+    )
+    _add_library_items(
+        session,
+        user.id,
+        [
+            ("v1", "Song 1", "Artist A"),
+            ("v2", "Song 2", "Artist B"),
+            ("v3", "Song 3", "Artist C"),
+            ("v4", "Song 4", "Artist D"),
+        ],
+    )
+    service = _service(session)
+
+    mock_response = _mock_cluster_response("Chill Electronic", "Laid-back electronic songs", [0, 1, 2, 3])
+    with patch("app.services.library_analysis.completion", return_value=mock_response) as mock_completion:
+        service.propose_new_playlists(user.id)
+
+    _, kwargs = mock_completion.call_args
+    user_message = kwargs["messages"][1]["content"]
+    assert "EDM mix" in user_message
+    assert "High-energy electronic dance music and remixes." in user_message
+
+
+def test_clustering_prompt_discourages_same_artist_groupings(session):
+    from app.services.library_analysis import SYSTEM_PROMPT
+
+    assert "never by artist identity" in SYSTEM_PROMPT.lower() or "not by artist" in SYSTEM_PROMPT.lower()
+
+
 def test_added_playlists_shown_for_context_but_not_modified(session):
     user = _make_user(session)
     existing = PlaylistRepository(session).create(
