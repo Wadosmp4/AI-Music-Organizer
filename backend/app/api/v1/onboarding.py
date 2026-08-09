@@ -259,3 +259,29 @@ def get_apply_status(
         apply_status=reorganize_session.apply_status,
         apply_last_result=reorganize_session.apply_last_result,
     )
+
+
+class CancelReorganizeResponse(BaseModel):
+    session_id: int
+    clustering_status: str
+
+
+@router.post("/reorganize/{session_id}/cancel", response_model=CancelReorganizeResponse)
+def cancel_reorganize(
+    session_id: int,
+    user: User = Depends(get_default_user),
+    service: LibraryAnalysisService = Depends(get_library_analysis_service),
+) -> CancelReorganizeResponse:
+    """Lets the user abandon an open session instead of finishing it --
+    every non-terminal session-tagged item is discarded (never written to
+    YouTube) and the session is marked cancelled. Rejected, like the apply
+    trigger, while this session's own apply is already running."""
+    try:
+        reorganize_session = service.cancel_reorganize(session_id, user.id)
+    except ReorganizeSessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ApplyAlreadyInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return CancelReorganizeResponse(
+        session_id=reorganize_session.id, clustering_status=reorganize_session.clustering_status
+    )

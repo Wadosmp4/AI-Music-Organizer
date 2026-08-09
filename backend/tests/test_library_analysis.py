@@ -538,6 +538,91 @@ def test_reorganize_clustering_batch_failure_does_not_block_other_batches(sessio
     assert status.proposals[0].name == "Second Batch"
 
 
+def test_cancel_reorganize_rejects_non_terminal_session_items_and_marks_session_cancelled(session):
+    from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
+
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1", "v2"])
+    service = _service(session, music_client=music_client)
+    reorganize_session, _ = service.trigger_reorganize(user.id)
+
+    library_items = _add_library_items(
+        session, user.id, [("v1", "Song 1", "Artist"), ("v2", "Song 2", "Artist")]
+    )
+    pending_item = ReviewQueueItem(
+        user_id=user.id,
+        library_item_id=library_items[0].id,
+        status="pending",
+        reorganize_session_id=reorganize_session.id,
+    )
+    approved_pending_apply_item = ReviewQueueItem(
+        user_id=user.id,
+        library_item_id=library_items[1].id,
+        status="approved_pending_apply",
+        reorganize_session_id=reorganize_session.id,
+    )
+    session.add(pending_item)
+    session.add(approved_pending_apply_item)
+    session.commit()
+    session.refresh(pending_item)
+    session.refresh(approved_pending_apply_item)
+
+    service.cancel_reorganize(reorganize_session.id, user.id)
+
+    review_queue_repo = ReviewQueueRepository(session)
+    assert review_queue_repo.get(pending_item.id).status == "rejected"
+    assert review_queue_repo.get(approved_pending_apply_item.id).status == "rejected"
+
+    cancelled_session = ReorganizeSessionRepository(session).get(reorganize_session.id)
+    assert cancelled_session.clustering_status == "cancelled"
+
+
+def test_cancelled_session_is_not_reused_by_a_later_trigger(session):
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+    user = _make_user(session)
+
+    first_session, _ = service.trigger_reorganize(user.id)
+    service.cancel_reorganize(first_session.id, user.id)
+
+    second_session, _ = service.trigger_reorganize(user.id)
+
+    assert second_session.id != first_session.id
+
+
+def test_cancel_reorganize_is_rejected_while_its_own_apply_is_in_progress(session):
+    from app.services.reorganize_apply import ApplyAlreadyInProgressError
+
+    user = _make_user(session)
+    music_client = _fake_music_client()
+    music_client.get_liked_songs.return_value = _fake_liked_songs(["v1"])
+    service = _service(session, music_client=music_client)
+    reorganize_session, _ = service.trigger_reorganize(user.id)
+    reorganize_session.apply_status = "in_progress"
+    ReorganizeSessionRepository(session).update(reorganize_session)
+
+    try:
+        service.cancel_reorganize(reorganize_session.id, user.id)
+        assert False, "expected ApplyAlreadyInProgressError"
+    except ApplyAlreadyInProgressError:
+        pass
+
+
+def test_cancel_reorganize_raises_for_unknown_session(session):
+    from app.services.reorganize_apply import ReorganizeSessionNotFoundError
+
+    user = _make_user(session)
+    service = _service(session)
+
+    try:
+        service.cancel_reorganize(999999, user.id)
+        assert False, "expected ReorganizeSessionNotFoundError"
+    except ReorganizeSessionNotFoundError:
+        pass
+
+
 def test_reorganize_status_reports_stalled_when_no_recent_proposal_activity(session):
     from datetime import timedelta
 

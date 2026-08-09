@@ -54,6 +54,12 @@ class ReorganizeSessionRepository:
         return latest if self._is_unresolved(latest) else None
 
     def _is_unresolved(self, reorganize_session: ReorganizeSession) -> bool:
+        # A cancelled session is resolved by definition, even if its snapshot
+        # was never fully matched -- skip the matching-completeness check
+        # below, which would otherwise misread the abandoned remainder as
+        # still-open work.
+        if reorganize_session.clustering_status == "cancelled":
+            return False
         if reorganize_session.clustering_status in ("pending", "in_progress", "stalled"):
             return True
         if reorganize_session.apply_status == "in_progress":

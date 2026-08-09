@@ -313,3 +313,15 @@ export function triggerFinishAndApply(sessionId: number): Promise<ApplyTrigger> 
 export function fetchApplyStatus(sessionId: number): Promise<ApplyStatus> {
   return request<ApplyStatus>(`/onboarding/reorganize/${sessionId}/apply-status`);
 }
+
+// Lets the user abandon an open session instead of being forced to finish
+// it -- every non-terminal session-tagged item is discarded (never written
+// to YouTube). Rejected (409) while this session's own apply is running.
+export interface CancelReorganize {
+  session_id: number;
+  clustering_status: string;
+}
+
+export function cancelReorganize(sessionId: number): Promise<CancelReorganize> {
+  return request<CancelReorganize>(`/onboarding/reorganize/${sessionId}/cancel`, { method: "POST" });
+}

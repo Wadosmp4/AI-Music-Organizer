@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -286,6 +286,192 @@ describe("Onboarding", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
 
     confirmSpy.mockRestore();
+  });
+
+  it("shows a running suggestion count while clustering is in progress", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+        proposals: [],
+        existing_playlists: [],
+        added_playlists: [],
+      });
+      vi.mocked(client.triggerReorganize).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "in_progress",
+      });
+      vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "in_progress",
+        proposals: [{ name: "90s R&B", theme: "throwback grooves", song_count: 8 }],
+      });
+
+      render(<Onboarding />);
+      await screen.findByText("No new-playlist suggestions found.");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Reorganize My Library"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(screen.getByText("1 suggestion(s) found so far", { exact: false })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps earlier suggestions after retrying the same stalled session", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+        proposals: [],
+        existing_playlists: [],
+        added_playlists: [],
+      });
+      vi.mocked(client.triggerReorganize).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "in_progress",
+      });
+      vi.mocked(client.fetchReorganizeStatus).mockResolvedValueOnce({
+        session_id: 1,
+        clustering_status: "stalled",
+        proposals: [{ name: "90s R&B", theme: "throwback grooves", song_count: 8 }],
+      });
+
+      render(<Onboarding />);
+      await screen.findByText("No new-playlist suggestions found.");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Reorganize My Library"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await screen.findByText("Try again");
+      expect(screen.getByText("90s R&B", { exact: false })).toBeInTheDocument();
+
+      // Retrying reuses the same (stalled) session -- the backend returns
+      // the same session_id -- so the suggestion found above must survive.
+      vi.mocked(client.fetchReorganizeStatus).mockResolvedValueOnce({
+        session_id: 1,
+        clustering_status: "done",
+        proposals: [{ name: "90s R&B", theme: "throwback grooves", song_count: 8 }],
+      });
+      await user.click(screen.getByText("Try again"));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+
+      expect(screen.getByText("90s R&B", { exact: false })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows classified-song progress while matching runs", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [],
+      added_playlists: [],
+    });
+    vi.mocked(client.triggerReorganize).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+    });
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+      proposals: [],
+    });
+    let resolveBatch: (value: client.ReorganizeMatchResult) => void = () => {};
+    vi.mocked(client.runReorganizeMatchBatch)
+      .mockResolvedValueOnce({ ran: true, processed: 50, queue_items_created: 10, matching_complete: false })
+      .mockImplementationOnce(
+        () => new Promise((resolve) => { resolveBatch = resolve; }),
+      );
+    vi.mocked(client.submitOnboardingSelection).mockResolvedValue({ created_playlists: [] });
+
+    render(<Onboarding />);
+    await screen.findByText("No new-playlist suggestions found.");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Reorganize My Library"));
+    await screen.findByText("No new playlist suggestions this run.");
+
+    await user.click(screen.getByText("Finish setup"));
+
+    await screen.findByText("Matching your library… (50 song(s) classified)");
+    await act(async () => {
+      resolveBatch({ ran: true, processed: 25, queue_items_created: 5, matching_complete: true });
+      await Promise.resolve();
+    });
+    await screen.findByRole("status");
+  });
+
+  it("cancels an open reorganize session and reverts to the pre-reorganize state", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [{ name: "Stale Suggestion", theme: "old", song_count: 6, confidence: 0.5 }],
+      existing_playlists: [],
+      added_playlists: [],
+    });
+    vi.mocked(client.triggerReorganize).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+    });
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+      proposals: [],
+    });
+    vi.mocked(client.cancelReorganize).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "cancelled",
+    });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<Onboarding />);
+    await screen.findByText("Stale Suggestion");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Reorganize My Library"));
+    await screen.findByText("Cancel this session");
+
+    await user.click(screen.getByText("Cancel this session"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(client.cancelReorganize).toHaveBeenCalledWith(1);
+    await waitFor(() => {
+      expect(screen.queryByText("Cancel this session")).not.toBeInTheDocument();
+    });
+
+    confirmSpy.mockRestore();
+  });
+
+  it("notes that approvals are deferred while a reorganize session is open", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [],
+      added_playlists: [],
+    });
+    vi.mocked(client.triggerReorganize).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+    });
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+      session_id: 1,
+      clustering_status: "done",
+      proposals: [],
+    });
+
+    render(<Onboarding />);
+    await screen.findByText("No new-playlist suggestions found.");
+    expect(screen.queryByText(/won't be written to YouTube until/)).not.toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Reorganize My Library"));
+
+    await screen.findByText(/won't be written to YouTube until/);
   });
 
   it("shows the done confirmation without switching away in the same tick", async () => {

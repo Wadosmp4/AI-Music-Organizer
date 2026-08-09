@@ -34,9 +34,10 @@ from app.models.reorganize_session import ReorganizeSession
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
-from app.repositories.review_queue_repository import ReviewQueueRepository
+from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
 from app.repositories.user_repository import UserRepository
 from app.services.genre_lookup import GenreLookupService
+from app.services.reorganize_apply import ApplyAlreadyInProgressError, ReorganizeSessionNotFoundError
 
 litellm.suppress_debug_info = True
 
@@ -385,6 +386,35 @@ class LibraryAnalysisService:
             clustering_status=clustering_status,
             proposals=proposals,
         )
+
+    def cancel_reorganize(self, reorganize_session_id: int, user_id: int) -> ReorganizeSession:
+        """Lets the user abandon an open session instead of being forced to
+        finish it. Rejects every non-terminal session-tagged
+        review_queue_item -- those decisions (and any unclustered remainder
+        of the snapshot) are simply discarded, never written to YouTube --
+        then marks the session cancelled so a later trigger starts a fresh
+        one rather than resuming this one (see _is_unresolved).
+        """
+        reorganize_session = self.reorganize_session_repository.get(reorganize_session_id)
+        if reorganize_session is None or reorganize_session.user_id != user_id:
+            raise ReorganizeSessionNotFoundError(f"reorganize session {reorganize_session_id} not found")
+        if reorganize_session.apply_status == "in_progress":
+            raise ApplyAlreadyInProgressError(
+                f"reorganize session {reorganize_session_id} has an apply in progress"
+            )
+
+        for item in self.review_queue_repository.list_for_user(user_id):
+            if item.reorganize_session_id != reorganize_session_id:
+                continue
+            if item.status not in ("pending", "approved_pending_apply"):
+                continue
+            try:
+                self.review_queue_repository.update(item.id, item.version, status="rejected")
+            except VersionConflictError:
+                continue  # a concurrent update already resolved this row
+
+        reorganize_session.clustering_status = "cancelled"
+        return self.reorganize_session_repository.update(reorganize_session)
 
     def propose_new_playlists(self, user_id: int) -> list[PlaylistProposal]:
         if not self.openrouter_api_key:

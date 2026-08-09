@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   addToPlaylist,
   approveItem,
+  cancelReorganize,
   checkForNewSongs,
   fetchApplyStatus,
   fetchAuthStatus,
@@ -85,6 +86,7 @@ export function ReviewQueue() {
   const [resetting, setResetting] = useState(false);
   const [applying, setApplying] = useState(false);
   const [applyResult, setApplyResult] = useState<ApplyLastResult | null>(null);
+  const [cancelling, setCancelling] = useState(false);
   const mountedRef = useRef(true);
 
   const items = useMemo(() => allItems.filter((item) => item.status === "pending"), [allItems]);
@@ -228,7 +230,43 @@ export function ReviewQueue() {
     }
   }
 
+  // Lets the user abandon this session instead of being forced to finish
+  // it -- every non-terminal item it produced is discarded server-side
+  // (never written to YouTube), so they simply drop off this list.
+  async function handleCancelSession() {
+    if (openReorganizeSessionId === null) return;
+    if (
+      !window.confirm(
+        "Cancel this reorganize session? Its pending and not-yet-applied approvals will be " +
+          "discarded -- nothing has been written to YouTube yet.",
+      )
+    ) {
+      return;
+    }
+    setCancelling(true);
+    setError(null);
+    try {
+      await cancelReorganize(openReorganizeSessionId);
+      if (!mountedRef.current) return;
+      await loadQueue();
+    } catch (err) {
+      if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (mountedRef.current) setCancelling(false);
+    }
+  }
+
   const groups = useMemo(() => groupByPlaylist(items), [items]);
+
+  // Titles for the apply-result banner's failed songs (falls back to just
+  // the count in the JSX below if none of them are still in allItems).
+  const failedItemTitles = useMemo(() => {
+    if (!applyResult || applyResult.failed_item_ids.length === 0) return [];
+    const byId = new Map(allItems.map((item) => [item.id, item]));
+    return applyResult.failed_item_ids
+      .map((id) => byId.get(id)?.title)
+      .filter((title): title is string => title !== undefined);
+  }, [applyResult, allItems]);
 
   // A song already has a pending/approved candidate in these playlists (its
   // original suggestion plus any manual adds) -- offering them again in its
@@ -275,13 +313,22 @@ export function ReviewQueue() {
           <span>
             A reorganize session is open — approvals here are saved locally until you apply them.
           </span>
-          <button
-            onClick={() => void handleFinishAndApply()}
-            disabled={applying}
-            className="w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-          >
-            {applying ? "Applying…" : "Finish & Apply"}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => void handleCancelSession()}
+              disabled={applying || cancelling}
+              className="w-fit rounded-full px-4 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+            >
+              {cancelling ? "Cancelling…" : "Cancel session"}
+            </button>
+            <button
+              onClick={() => void handleFinishAndApply()}
+              disabled={applying || cancelling}
+              className="w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {applying ? "Applying…" : "Finish & Apply"}
+            </button>
+          </div>
         </div>
       )}
       {applyResult && (
@@ -293,7 +340,8 @@ export function ReviewQueue() {
           <span>
             Finish & Apply: {applyResult.succeeded} song(s) added
             {applyResult.failed > 0
-              ? `, ${applyResult.failed} failed and will retry on the next apply.`
+              ? `, ${applyResult.failed} failed and will retry on the next apply` +
+                (failedItemTitles.length > 0 ? ` (${failedItemTitles.join(", ")}).` : ".")
               : "."}
           </span>
           <button

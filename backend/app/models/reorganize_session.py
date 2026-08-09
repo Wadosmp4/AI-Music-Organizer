@@ -15,8 +15,12 @@ from sqlmodel import Field
 
 from app.models.base import TimestampMixin
 
-# KTD9: background clustering progress, polled by the frontend.
-CLUSTERING_STATUSES = ("pending", "in_progress", "done", "stalled")
+# KTD9: background clustering progress, polled by the frontend. "cancelled"
+# is a terminal, non-retryable outcome distinct from "done"/"stalled" -- a
+# cancelled session is never reused by get_open_for_user (see
+# ReorganizeSessionRepository._is_unresolved), so the next trigger always
+# starts a fresh one.
+CLUSTERING_STATUSES = ("pending", "in_progress", "done", "stalled", "cancelled")
 
 # KTD10: doubles as Finish & Apply's concurrent-apply guard -- a new apply
 # trigger is rejected while a session's apply_status is "in_progress".

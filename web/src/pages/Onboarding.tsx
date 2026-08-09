@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   asPlaylistRemovalConfirmation,
+  cancelReorganize,
   fetchOnboardingAnalysis,
   fetchReorganizeStatus,
   runReorganizeMatchBatch,
@@ -55,6 +56,10 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   const [clusteringStatus, setClusteringStatus] = useState<ClusteringStatus>("idle");
   const [reorganizeTriggering, setReorganizeTriggering] = useState(false);
   const [matchingInProgress, setMatchingInProgress] = useState(false);
+  // Batches already run this "Finish setup" -- surfaced as "songs classified
+  // so far" progress instead of a static "Matching your library…" label.
+  const [matchedSoFar, setMatchedSoFar] = useState(0);
+  const [cancelling, setCancelling] = useState(false);
 
   const mountedRef = useRef(true);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -111,11 +116,15 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     try {
       const result = await triggerReorganize();
       if (!mountedRef.current) return;
+      // A retry that reuses the same (e.g. stalled) session appends to what
+      // it already found rather than discarding it -- only a genuinely new
+      // session supersedes the prior proposals (the static analysis-time
+      // snapshot on first trigger, AE4, or a just-cancelled session's).
+      if (result.session_id !== reorganizeSessionId) {
+        setProposals([]);
+      }
       setReorganizeSessionId(result.session_id);
       setClusteringStatus(result.clustering_status as ClusteringStatus);
-      // A fresh clustering pass over the complete current library supersedes
-      // whatever the static analysis-time snapshot showed (AE4).
-      setProposals([]);
       stopPolling();
       pollRef.current = setInterval(() => void pollReorganizeStatus(result.session_id), REORGANIZE_POLL_INTERVAL_MS);
     } catch (err) {
@@ -155,10 +164,42 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   // songs") until the whole snapshot has been matched, so the Review Queue
   // has something to show as soon as the reorganize screen hands off.
   async function runMatchingToCompletion(sessionId: number) {
+    setMatchedSoFar(0);
     for (let i = 0; i < MAX_MATCHING_BATCHES; i++) {
       const result = await runReorganizeMatchBatch(sessionId);
       if (!mountedRef.current) return;
+      setMatchedSoFar((prev) => prev + result.processed);
       if (result.matching_complete || !result.ran) return;
+    }
+  }
+
+  // Lets the user abandon this session instead of being forced to finish
+  // it -- every non-terminal item it already produced is discarded server-
+  // side (never written to YouTube); the screen reverts to its
+  // pre-reorganize state so a fresh trigger starts clean.
+  async function handleCancelReorganize() {
+    if (reorganizeSessionId === null) return;
+    if (
+      !window.confirm(
+        "Cancel this reorganize session? Any suggestions or approvals from it will be discarded " +
+          "-- nothing has been written to YouTube yet.",
+      )
+    ) {
+      return;
+    }
+    setCancelling(true);
+    setError(null);
+    try {
+      await cancelReorganize(reorganizeSessionId);
+      if (!mountedRef.current) return;
+      stopPolling();
+      setReorganizeSessionId(null);
+      setClusteringStatus("idle");
+      setProposals([]);
+    } catch (err) {
+      if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (mountedRef.current) setCancelling(false);
     }
   }
 
@@ -278,6 +319,18 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
                 .
               </p>
             )}
+            {reorganizeSessionId !== null && (
+              <p className="mt-3 text-sm text-slate-500">
+                Session open.{" "}
+                <button
+                  onClick={() => void handleCancelReorganize()}
+                  disabled={cancelling}
+                  className="font-medium text-rose-600 underline disabled:opacity-50"
+                >
+                  {cancelling ? "Cancelling…" : "Cancel this session"}
+                </button>
+              </p>
+            )}
           </section>
 
           <section className={CARD}>
@@ -354,8 +407,11 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
                   : "No new-playlist suggestions found."}
               </p>
             )}
-            {proposals.length === 0 && clusteringStatus === "in_progress" && (
-              <p className="text-sm text-slate-500">Clustering your library…</p>
+            {clusteringStatus === "in_progress" && (
+              <p className="text-sm text-slate-500">
+                Clustering your library…
+                {proposals.length > 0 && ` (${proposals.length} suggestion(s) found so far)`}
+              </p>
             )}
             <ul className="flex flex-col gap-2">
               {proposals.map((proposal) => {
@@ -425,12 +481,20 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
             )}
           </section>
 
+          {reorganizeSessionId !== null && !matchingInProgress && (
+            <p className="text-sm text-slate-500">
+              A reorganize session is open — songs you approve on the Review Queue screen won't be
+              written to YouTube until you click "Finish &amp; Apply" there.
+            </p>
+          )}
           <button
             onClick={() => void handleFinish()}
             disabled={matchingInProgress}
             className={PRIMARY_BUTTON}
           >
-            {matchingInProgress ? "Matching your library…" : "Finish setup"}
+            {matchingInProgress
+              ? `Matching your library… (${matchedSoFar} song(s) classified)`
+              : "Finish setup"}
           </button>
         </>
       )}

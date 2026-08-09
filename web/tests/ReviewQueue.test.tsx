@@ -420,4 +420,86 @@ describe("ReviewQueue", () => {
       vi.useRealTimers();
     }
   });
+
+  it("names the failed songs in the apply-result banner when they're still in the queue", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const pendingItem = makeItem({
+        id: 2,
+        title: "Song That Failed",
+        status: "pending",
+        reorganize_session_id: 42,
+      });
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+      vi.mocked(client.fetchReviewQueue)
+        .mockResolvedValueOnce([pendingItem])
+        .mockResolvedValueOnce([{ ...pendingItem, status: "approved_pending_apply" }]);
+      vi.mocked(client.triggerFinishAndApply).mockResolvedValue({
+        session_id: 42,
+        apply_status: "in_progress",
+      });
+      vi.mocked(client.fetchApplyStatus).mockResolvedValueOnce({
+        session_id: 42,
+        apply_status: "idle",
+        apply_last_result: { succeeded: 0, failed: 1, failed_item_ids: [2], remaining: 1 },
+      });
+
+      render(<ReviewQueue />);
+      await screen.findByTestId("reorganize-session-banner");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Finish & Apply"));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("apply-result")).toHaveTextContent("Song That Failed");
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels an open reorganize session and hides the banner once its items are terminal", async () => {
+    const sessionItem = makeItem({ id: 1, status: "pending", reorganize_session_id: 42 });
+    vi.mocked(client.fetchReviewQueue)
+      .mockResolvedValueOnce([sessionItem])
+      .mockResolvedValueOnce([{ ...sessionItem, status: "rejected" }]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.cancelReorganize).mockResolvedValue({
+      session_id: 42,
+      clustering_status: "cancelled",
+    });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("reorganize-session-banner");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Cancel session"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(client.cancelReorganize).toHaveBeenCalledWith(42);
+    await waitFor(() => {
+      expect(screen.queryByTestId("reorganize-session-banner")).not.toBeInTheDocument();
+    });
+
+    confirmSpy.mockRestore();
+  });
+
+  it("does not cancel the session when the confirmation is declined", async () => {
+    const sessionItem = makeItem({ id: 1, status: "pending", reorganize_session_id: 42 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([sessionItem]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("reorganize-session-banner");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Cancel session"));
+
+    expect(client.cancelReorganize).not.toHaveBeenCalled();
+    expect(screen.getByTestId("reorganize-session-banner")).toBeInTheDocument();
+
+    confirmSpy.mockRestore();
+  });
 });
