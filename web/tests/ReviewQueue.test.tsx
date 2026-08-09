@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -30,6 +30,7 @@ function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.Revie
     title: "Test Song",
     artist: "Test Artist",
     playlist_name: "Test Playlist",
+    reorganize_session_id: null,
     ...overrides,
   };
 }
@@ -344,5 +345,79 @@ describe("ReviewQueue", () => {
     await screen.findByTestId("queue-item-1");
     const attributions = screen.getAllByTestId("bpm-attribution");
     expect(attributions).toHaveLength(1);
+  });
+
+  it("shows the reorganize session banner while a non-terminal session item exists, and hides it once it's terminal", async () => {
+    const sessionItem = makeItem({ id: 1, status: "pending", reorganize_session_id: 42 });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([sessionItem]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.rejectItem).mockResolvedValue({ ...sessionItem, status: "rejected" });
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("reorganize-session-banner");
+    expect(screen.getByText("Finish & Apply")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Reject"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("reorganize-session-banner")).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not show the reorganize session banner when no item belongs to an open session", async () => {
+    const item = makeItem({ id: 1, status: "pending", reorganize_session_id: null });
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("queue-item-1");
+
+    expect(screen.queryByTestId("reorganize-session-banner")).not.toBeInTheDocument();
+  });
+
+  it("triggers Finish & Apply, polls until it finishes, and keeps the failure summary visible alongside a still-open banner", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const pendingItem = makeItem({ id: 1, status: "pending", reorganize_session_id: 42 });
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+      vi.mocked(client.fetchReviewQueue)
+        .mockResolvedValueOnce([pendingItem])
+        // Post-apply reload: this item's write failed and reverted to
+        // approved_pending_apply -- the session is still open (non-terminal).
+        .mockResolvedValueOnce([{ ...pendingItem, status: "approved_pending_apply" }]);
+      vi.mocked(client.triggerFinishAndApply).mockResolvedValue({
+        session_id: 42,
+        apply_status: "in_progress",
+      });
+      vi.mocked(client.fetchApplyStatus)
+        .mockResolvedValueOnce({ session_id: 42, apply_status: "in_progress", apply_last_result: null })
+        .mockResolvedValueOnce({
+          session_id: 42,
+          apply_status: "idle",
+          apply_last_result: { succeeded: 1, failed: 1, failed_item_ids: [2], remaining: 1 },
+        });
+
+      render(<ReviewQueue />);
+      await screen.findByTestId("reorganize-session-banner");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Finish & Apply"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("apply-result")).toHaveTextContent("1 song(s) added");
+      });
+      expect(screen.getByTestId("apply-result")).toHaveTextContent(
+        "1 failed and will retry on the next apply",
+      );
+      // The reverted item is still non-terminal, so the banner stays up too.
+      expect(screen.getByTestId("reorganize-session-banner")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

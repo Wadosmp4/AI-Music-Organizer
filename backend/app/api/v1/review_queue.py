@@ -58,6 +58,9 @@ class ReviewQueueItemResponse(BaseModel):
     # Same reasoning applies to the destination: a bare numeric playlist_id
     # forces the reviewer to remember which id is which playlist by heart.
     playlist_name: Optional[str]
+    # U7: lets the frontend detect an open reorganize session (and its id)
+    # straight from the queue listing rather than a separate lookup.
+    reorganize_session_id: Optional[int]
 
 
 def _to_response(
@@ -78,6 +81,7 @@ def _to_response(
         title=library_item.title if library_item else "(unknown song)",
         artist=library_item.artist if library_item else "(unknown artist)",
         playlist_name=playlist.name if playlist else None,
+        reorganize_session_id=item.reorganize_session_id,
     )
 
 

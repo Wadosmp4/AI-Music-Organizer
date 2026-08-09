@@ -24,6 +24,7 @@ export interface ReviewQueueItem {
   title: string;
   artist: string;
   playlist_name: string | null;
+  reorganize_session_id: number | null;
 }
 
 export interface StatusEntry {
@@ -83,6 +84,22 @@ export interface OnboardingAnalysis {
   added_playlists: AddedPlaylist[];
 }
 
+// Carries the parsed JSON error body (when the response had one) alongside
+// the HTTP status, so callers that need structured detail -- e.g. U7's
+// playlist-removal confirmation (KTD7) -- don't have to re-parse a plain
+// Error's message string.
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+
+  constructor(status: number, body: unknown, message: string) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     // X-Requested-With: the backend's CSRF guard (app/main.py) requires this
@@ -93,8 +110,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`Request to ${path} failed (${response.status}): ${body}`);
+    const text = await response.text();
+    let body: unknown = null;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      // Not a JSON body -- ApiError.body stays null, message keeps the raw text.
+    }
+    throw new ApiError(response.status, body, `Request to ${path} failed (${response.status}): ${text}`);
   }
   return response.json() as Promise<T>;
 }
@@ -156,11 +179,16 @@ export function fetchOnboardingAnalysis(): Promise<OnboardingAnalysis> {
   return request<OnboardingAnalysis>("/onboarding/analysis");
 }
 
+// KTD7: a playlist id in `removedPlaylistIds` with non-terminal review work
+// still referencing it is rejected (409) unless it's also listed here --
+// the caller resubmits with the confirmed id once the user approves removal
+// anyway (see the ApiError thrown by `request` and Onboarding.tsx's retry).
 export function submitOnboardingSelection(
   acceptedProposals: { name: string; theme: string }[],
   customPlaylists: { name: string; description: string }[],
   adoptedPlaylists: { playlist_id: string; name: string }[] = [],
   removedPlaylistIds: number[] = [],
+  confirmedRemovedPlaylistIds: number[] = [],
 ): Promise<{ created_playlists: CreatedPlaylist[] }> {
   return request("/onboarding/select", {
     method: "POST",
@@ -169,8 +197,34 @@ export function submitOnboardingSelection(
       custom_playlists: customPlaylists,
       adopted_playlists: adoptedPlaylists,
       removed_playlist_ids: removedPlaylistIds,
+      confirmed_removed_playlist_ids: confirmedRemovedPlaylistIds,
     }),
   });
+}
+
+// The 409 body shape `POST /onboarding/select` returns (KTD7) when a
+// removed playlist still has non-terminal review work referencing it.
+export interface PlaylistRemovalConfirmation {
+  reason: "removal_requires_confirmation";
+  playlist_id: number;
+  playlist_name: string;
+  pending_count: number;
+}
+
+// `ApiError.body` is the raw parsed JSON response; FastAPI's HTTPException
+// wraps a dict `detail` as `{ detail: {...} }`. Returns null for any other
+// error shape so callers can fall through to their generic error handling.
+export function asPlaylistRemovalConfirmation(err: unknown): PlaylistRemovalConfirmation | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const detail = (err.body as { detail?: unknown } | null)?.detail;
+  if (
+    detail &&
+    typeof detail === "object" &&
+    (detail as { reason?: string }).reason === "removal_requires_confirmation"
+  ) {
+    return detail as PlaylistRemovalConfirmation;
+  }
+  return null;
 }
 
 export function checkForNewSongs(): Promise<{
@@ -215,4 +269,47 @@ export function triggerReorganize(): Promise<ReorganizeTrigger> {
 
 export function fetchReorganizeStatus(sessionId: number): Promise<ReorganizeStatus> {
   return request<ReorganizeStatus>(`/onboarding/reorganize/${sessionId}`);
+}
+
+// U4: one session-scoped matching batch (R6/R7) -- same batch-and-click
+// shape as `checkForNewSongs`; the caller loops until `matching_complete`.
+export interface ReorganizeMatchResult {
+  ran: boolean;
+  processed: number;
+  queue_items_created: number;
+  matching_complete: boolean;
+}
+
+export function runReorganizeMatchBatch(sessionId: number): Promise<ReorganizeMatchResult> {
+  return request<ReorganizeMatchResult>(`/ingestion/reorganize/${sessionId}/match`, { method: "POST" });
+}
+
+// U6: Finish & Apply (R9/R10/R11) -- creates any missing playlists and
+// writes every approved_pending_apply item, best-effort, as a background
+// task; the trigger response returns immediately, so the caller polls
+// `fetchApplyStatus` for completion.
+export interface ApplyTrigger {
+  session_id: number;
+  apply_status: string;
+}
+
+export interface ApplyLastResult {
+  succeeded: number;
+  failed: number;
+  failed_item_ids: number[];
+  remaining: number;
+}
+
+export interface ApplyStatus {
+  session_id: number;
+  apply_status: string;
+  apply_last_result: ApplyLastResult | null;
+}
+
+export function triggerFinishAndApply(sessionId: number): Promise<ApplyTrigger> {
+  return request<ApplyTrigger>(`/onboarding/reorganize/${sessionId}/apply`, { method: "POST" });
+}
+
+export function fetchApplyStatus(sessionId: number): Promise<ApplyStatus> {
+  return request<ApplyStatus>(`/onboarding/reorganize/${sessionId}/apply-status`);
 }

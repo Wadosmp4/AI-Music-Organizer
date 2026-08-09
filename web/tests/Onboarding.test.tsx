@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -78,6 +78,7 @@ describe("Onboarding", () => {
       [],
       [{ playlist_id: "yt-1", name: "Road Trip" }],
       [],
+      [],
     );
   });
 
@@ -101,7 +102,7 @@ describe("Onboarding", () => {
 
     await user.click(screen.getByText("Finish setup"));
 
-    expect(client.submitOnboardingSelection).toHaveBeenCalledWith([], [], [], [7]);
+    expect(client.submitOnboardingSelection).toHaveBeenCalledWith([], [], [], [7], []);
   });
 
   it("adds a custom playlist as a chip and clears the form", async () => {
@@ -121,6 +122,170 @@ describe("Onboarding", () => {
 
     expect(screen.getByText("Road Trip")).toBeInTheDocument();
     expect(screen.getByLabelText("Name")).toHaveValue("");
+  });
+
+  it("streams reorganize suggestions across multiple polls without re-ordering earlier ones", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+        proposals: [],
+        existing_playlists: [],
+        added_playlists: [],
+      });
+      vi.mocked(client.triggerReorganize).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "in_progress",
+      });
+      vi.mocked(client.fetchReorganizeStatus)
+        .mockResolvedValueOnce({
+          session_id: 1,
+          clustering_status: "in_progress",
+          proposals: [{ name: "90s R&B", theme: "throwback grooves", song_count: 8 }],
+        })
+        .mockResolvedValueOnce({
+          session_id: 1,
+          clustering_status: "done",
+          proposals: [
+            { name: "90s R&B", theme: "throwback grooves", song_count: 8 },
+            { name: "Chill Electronic", theme: "downtempo", song_count: 5 },
+          ],
+        });
+
+      render(<Onboarding />);
+      await screen.findByText("No new-playlist suggestions found.");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Reorganize My Library"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(screen.getByText("90s R&B", { exact: false })).toBeInTheDocument();
+      expect(screen.queryByText("Chill Electronic", { exact: false })).not.toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(screen.getByText("90s R&B", { exact: false })).toBeInTheDocument();
+      expect(screen.getByText("Chill Electronic", { exact: false })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows an explicit empty state when a reorganize run completes with no proposals", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+        proposals: [{ name: "Stale Suggestion", theme: "old", song_count: 6, confidence: 0.5 }],
+        existing_playlists: [],
+        added_playlists: [],
+      });
+      vi.mocked(client.triggerReorganize).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "in_progress",
+      });
+      vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+        session_id: 1,
+        clustering_status: "done",
+        proposals: [],
+      });
+
+      render(<Onboarding />);
+      await screen.findByText("Stale Suggestion");
+
+      const user = userEvent.setup({ delay: null });
+      await user.click(screen.getByText("Reorganize My Library"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(screen.getByText("No new playlist suggestions this run.")).toBeInTheDocument();
+      expect(screen.queryByText("Stale Suggestion")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a confirmation prompt naming the playlist and affected count before removing a playlist with pending work", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [],
+      added_playlists: [{ id: 7, name: "Workout", description: null, rule: null }],
+    });
+    const confirmationError = Object.assign(new Error("conflict"), {
+      body: {
+        detail: {
+          reason: "removal_requires_confirmation",
+          playlist_id: 7,
+          playlist_name: "Workout",
+          pending_count: 3,
+        },
+      },
+    });
+    vi.mocked(client.submitOnboardingSelection)
+      .mockRejectedValueOnce(confirmationError)
+      .mockResolvedValueOnce({ created_playlists: [] });
+    vi.mocked(client.asPlaylistRemovalConfirmation).mockImplementation((err) => {
+      const body = (err as { body?: { detail?: unknown } }).body?.detail;
+      return body && typeof body === "object" && (body as { reason?: string }).reason === "removal_requires_confirmation"
+        ? (body as client.PlaylistRemovalConfirmation)
+        : null;
+    });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<Onboarding />);
+    await screen.findByText("Workout");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    await user.click(screen.getByText("Finish setup"));
+
+    await vi.waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(confirmSpy.mock.calls[0][0]).toContain("Workout");
+    expect(confirmSpy.mock.calls[0][0]).toContain("3");
+    expect(client.submitOnboardingSelection).toHaveBeenLastCalledWith([], [], [], [7], [7]);
+
+    confirmSpy.mockRestore();
+  });
+
+  it("does not resubmit the removal when the confirmation prompt is declined", async () => {
+    vi.mocked(client.fetchOnboardingAnalysis).mockResolvedValue({
+      proposals: [],
+      existing_playlists: [],
+      added_playlists: [{ id: 7, name: "Workout", description: null, rule: null }],
+    });
+    const confirmationError = Object.assign(new Error("conflict"), {
+      body: {
+        detail: {
+          reason: "removal_requires_confirmation",
+          playlist_id: 7,
+          playlist_name: "Workout",
+          pending_count: 3,
+        },
+      },
+    });
+    vi.mocked(client.submitOnboardingSelection).mockRejectedValueOnce(confirmationError);
+    vi.mocked(client.asPlaylistRemovalConfirmation).mockImplementation((err) => {
+      const body = (err as { body?: { detail?: unknown } }).body?.detail;
+      return body && typeof body === "object" && (body as { reason?: string }).reason === "removal_requires_confirmation"
+        ? (body as client.PlaylistRemovalConfirmation)
+        : null;
+    });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    render(<Onboarding />);
+    await screen.findByText("Workout");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("checkbox"));
+    await user.click(screen.getByText("Finish setup"));
+
+    await vi.waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(client.submitOnboardingSelection).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+
+    confirmSpy.mockRestore();
   });
 
   it("shows the done confirmation without switching away in the same tick", async () => {

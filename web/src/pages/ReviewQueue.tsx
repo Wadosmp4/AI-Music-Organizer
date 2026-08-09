@@ -4,12 +4,15 @@ import {
   addToPlaylist,
   approveItem,
   checkForNewSongs,
+  fetchApplyStatus,
   fetchAuthStatus,
   fetchPlaylists,
   fetchReviewQueue,
   rejectItem,
   resetBacklog,
+  triggerFinishAndApply,
   type AddedPlaylist,
+  type ApplyLastResult,
   type AuthStatus,
   type ReviewQueueItem,
 } from "../api/client";
@@ -55,8 +58,24 @@ function ConfidenceBadge({ confidence }: { confidence: number | null }) {
 
 const PILL_BUTTON = "rounded-full px-3 py-1 text-sm font-medium transition-colors";
 
+// KTD1/KTD7: a session-tagged item still counts as "open" work while it's
+// pending review or decided-but-not-yet-written -- once it's approved,
+// moved, rejected, or stale it's terminal and no longer keeps the session's
+// banner (or Finish & Apply control) visible.
+const NON_TERMINAL_SESSION_STATUSES = new Set(["pending", "approved_pending_apply"]);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const APPLY_POLL_INTERVAL_MS = 1500;
+
 export function ReviewQueue() {
-  const [items, setItems] = useState<ReviewQueueItem[]>([]);
+  // Unfiltered result of the last fetch -- `items` (below) is the
+  // pending-only subset actually rendered for review; the full set is kept
+  // around so an open reorganize session (U6/U7) can be detected even while
+  // its approved_pending_apply items are hidden from the review list.
+  const [allItems, setAllItems] = useState<ReviewQueueItem[]>([]);
   const [playlists, setPlaylists] = useState<AddedPlaylist[]>([]);
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -64,7 +83,21 @@ export function ReviewQueue() {
   const [checking, setChecking] = useState(false);
   const [checkMessage, setCheckMessage] = useState<string | null>(null);
   const [resetting, setResetting] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applyResult, setApplyResult] = useState<ApplyLastResult | null>(null);
   const mountedRef = useRef(true);
+
+  const items = useMemo(() => allItems.filter((item) => item.status === "pending"), [allItems]);
+
+  // The most recent still-open reorganize session, if any -- derived from
+  // the full item set (not just the visible pending ones) so approve/apply
+  // decisions already made this session still count toward "open".
+  const openReorganizeSessionId = useMemo(() => {
+    const openItem = allItems.find(
+      (item) => item.reorganize_session_id !== null && NON_TERMINAL_SESSION_STATUSES.has(item.status),
+    );
+    return openItem?.reorganize_session_id ?? null;
+  }, [allItems]);
 
   async function loadQueue() {
     try {
@@ -74,7 +107,7 @@ export function ReviewQueue() {
         fetchPlaylists(),
       ]);
       if (!mountedRef.current) return;
-      setItems(queue.filter((item) => item.status === "pending"));
+      setAllItems(queue);
       setAuthStatus(status);
       setPlaylists(playlistList);
     } catch (err) {
@@ -138,7 +171,7 @@ export function ReviewQueue() {
     const succeededIds = new Set(
       groupItems.filter((_, i) => results[i].status === "fulfilled").map((item) => item.id),
     );
-    setItems((prev) => prev.filter((i) => !succeededIds.has(i.id)));
+    setAllItems((prev) => prev.filter((i) => !succeededIds.has(i.id)));
     const failedCount = results.length - succeededIds.size;
     if (failedCount > 0) {
       setError(
@@ -149,7 +182,7 @@ export function ReviewQueue() {
 
   async function handleReject(item: ReviewQueueItem) {
     await rejectItem(item.id, item.version);
-    setItems((prev) => prev.filter((i) => i.id !== item.id));
+    setAllItems((prev) => prev.filter((i) => i.id !== item.id));
   }
 
   // Never an eager write -- the song is only ever queued as a pending
@@ -162,11 +195,37 @@ export function ReviewQueue() {
     const result = await addToPlaylist(item.id, item.version, targetPlaylistId);
     if (!mountedRef.current) return;
     if (result.id === item.id) {
-      setItems((prev) => prev.map((i) => (i.id === item.id ? result : i)));
+      setAllItems((prev) => prev.map((i) => (i.id === item.id ? result : i)));
     } else {
-      setItems((prev) => [...prev, result]);
+      setAllItems((prev) => [...prev, result]);
     }
     setCheckMessage(`Added "${item.title}" to ${targetName} — awaiting its own approval.`);
+  }
+
+  // U6: triggers Finish & Apply for the open session and polls until the
+  // background run finishes, then reloads the queue so terminal items drop
+  // off (or, on a partial failure, stay approved_pending_apply for retry).
+  async function handleFinishAndApply() {
+    if (openReorganizeSessionId === null) return;
+    setApplying(true);
+    setError(null);
+    try {
+      await triggerFinishAndApply(openReorganizeSessionId);
+      for (;;) {
+        const status = await fetchApplyStatus(openReorganizeSessionId);
+        if (!mountedRef.current) return;
+        if (status.apply_status !== "in_progress") {
+          setApplyResult(status.apply_last_result);
+          await loadQueue();
+          return;
+        }
+        await sleep(APPLY_POLL_INTERVAL_MS);
+      }
+    } catch (err) {
+      if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (mountedRef.current) setApplying(false);
+    }
   }
 
   const groups = useMemo(() => groupByPlaylist(items), [items]);
@@ -208,6 +267,43 @@ export function ReviewQueue() {
         </div>
       </div>
       <ConnectionHealthBanners authStatus={authStatus} />
+      {openReorganizeSessionId !== null && (
+        <div
+          data-testid="reorganize-session-banner"
+          className="flex items-center justify-between gap-3 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900"
+        >
+          <span>
+            A reorganize session is open — approvals here are saved locally until you apply them.
+          </span>
+          <button
+            onClick={() => void handleFinishAndApply()}
+            disabled={applying}
+            className="w-fit rounded-full bg-accent px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {applying ? "Applying…" : "Finish & Apply"}
+          </button>
+        </div>
+      )}
+      {applyResult && (
+        <div
+          role="status"
+          data-testid="apply-result"
+          className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 shadow-sm"
+        >
+          <span>
+            Finish & Apply: {applyResult.succeeded} song(s) added
+            {applyResult.failed > 0
+              ? `, ${applyResult.failed} failed and will retry on the next apply.`
+              : "."}
+          </span>
+          <button
+            onClick={() => setApplyResult(null)}
+            className="text-slate-500 hover:text-slate-700"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {checkMessage && (
         <p
           role="status"
