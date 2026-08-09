@@ -12,12 +12,25 @@ from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.api.deps import get_default_user, get_library_analysis_service
+from app.api.deps import (
+    ReorganizeMatchingDependencies,
+    get_default_user,
+    get_library_analysis_service,
+    get_music_client,
+    get_reorganize_matching_dependencies,
+)
+from app.integrations.base import MusicServiceClient
 from app.models.user import User
 from app.services.library_analysis import (
     LibraryAnalysisService,
     PlaylistRemovalRequiresConfirmationError,
     run_reorganize_clustering,
+)
+from app.services.reorganize_apply import (
+    ApplyAlreadyInProgressError,
+    ReorganizeSessionNotFoundError,
+    run_finish_and_apply,
+    trigger_apply,
 )
 
 router = APIRouter(prefix="/onboarding", tags=["onboarding"])
@@ -194,4 +207,55 @@ def get_reorganize_status(
             ReorganizeProposalResponse(name=p.name, theme=p.theme, song_count=p.song_count)
             for p in status.proposals
         ],
+    )
+
+
+class ApplyTriggerResponse(BaseModel):
+    session_id: int
+    apply_status: str
+
+
+class ApplyStatusResponse(BaseModel):
+    session_id: int
+    apply_status: str
+    apply_last_result: Optional[dict]
+
+
+@router.post("/reorganize/{session_id}/apply", response_model=ApplyTriggerResponse)
+def apply_reorganize(
+    session_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_default_user),
+    music_client: MusicServiceClient = Depends(get_music_client),
+    deps: ReorganizeMatchingDependencies = Depends(get_reorganize_matching_dependencies),
+) -> ApplyTriggerResponse:
+    """R9/R10/R11: creates any missing playlists and writes every
+    approved_pending_apply item, best-effort, as a background task (KTD9).
+    Can be triggered at any point in a session and applies whatever has been
+    decided so far (R10) -- rejected outright if this session's own apply is
+    already running (KTD10).
+    """
+    try:
+        reorganize_session = trigger_apply(deps.reorganize_session_repository, session_id, user.id)
+    except ReorganizeSessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ApplyAlreadyInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(run_finish_and_apply, session_id, user.id, music_client)
+    return ApplyTriggerResponse(session_id=reorganize_session.id, apply_status=reorganize_session.apply_status)
+
+
+@router.get("/reorganize/{session_id}/apply-status", response_model=ApplyStatusResponse)
+def get_apply_status(
+    session_id: int,
+    deps: ReorganizeMatchingDependencies = Depends(get_reorganize_matching_dependencies),
+) -> ApplyStatusResponse:
+    reorganize_session = deps.reorganize_session_repository.get(session_id)
+    if reorganize_session is None:
+        raise HTTPException(status_code=404, detail=f"reorganize session {session_id} not found")
+    return ApplyStatusResponse(
+        session_id=reorganize_session.id,
+        apply_status=reorganize_session.apply_status,
+        apply_last_result=reorganize_session.apply_last_result,
     )

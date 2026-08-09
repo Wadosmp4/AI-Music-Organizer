@@ -15,7 +15,12 @@ class ReviewQueueRepository:
         self.session = session
 
     def get(self, item_id: int) -> Optional[ReviewQueueItem]:
-        return self.session.get(ReviewQueueItem, item_id)
+        # populate_existing=True: this row may have been committed by a
+        # different Session (e.g. U2/U6's background tasks, which each open
+        # their own DB session) -- without it, a caller that already loaded
+        # this row earlier in the same Session would get back its own stale
+        # identity-mapped copy instead of the row's current state.
+        return self.session.get(ReviewQueueItem, item_id, populate_existing=True)
 
     def create(self, item: ReviewQueueItem) -> ReviewQueueItem:
         return save(self.session, item)
@@ -86,7 +91,6 @@ class ReviewQueueRepository:
             for item in self.list_for_user(user_id)
             if item.playlist_id is not None and item.status in self._ACTIVE_MATCH_STATUSES
         }
-        self.session.commit()
 
     def list_for_user(self, user_id: int) -> list[ReviewQueueItem]:
         return list(

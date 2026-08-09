@@ -227,12 +227,22 @@ def _mark_removed_songs(
     (KTD14), and any of its active review_queue items get CAS-updated to
     stale using their version as of `queue_items_snapshot` — never a silent
     overwrite if a concurrent user action already changed that row's version
-    in the meantime (KTD19)."""
-    active_queue_items_by_library_item_id: dict[int, list[ReviewQueueItem]] = {}
+    in the meantime (KTD19).
+
+    Captures each snapshot item's `(id, version)` as plain ints up front,
+    rather than holding onto the ORM object and reading `.version` lazily
+    later: `library_repository.mark_removed()` below calls `session.commit()`
+    on the same Session, which by default expires every object in its
+    identity map (not just the one just saved). A later `.version` attribute
+    access on an expired snapshot object transparently triggers a fresh
+    reload of the *current* DB row — silently replacing the intended stale
+    snapshot value with the live one and defeating this exact CAS check.
+    """
+    active_versions_by_library_item_id: dict[int, list[tuple[int, int]]] = {}
     for queue_item in queue_items_snapshot:
         if queue_item.status in _ACTIVE_QUEUE_STATUSES:
-            active_queue_items_by_library_item_id.setdefault(queue_item.library_item_id, []).append(
-                queue_item
+            active_versions_by_library_item_id.setdefault(queue_item.library_item_id, []).append(
+                (queue_item.id, queue_item.version)
             )
 
     marked = 0
@@ -241,9 +251,9 @@ def _mark_removed_songs(
             continue
         library_repository.mark_removed(item.id)
         marked += 1
-        for queue_item in active_queue_items_by_library_item_id.get(item.id, []):
+        for queue_item_id, queue_item_version in active_versions_by_library_item_id.get(item.id, []):
             try:
-                review_queue_repository.update(queue_item.id, queue_item.version, status="stale")
+                review_queue_repository.update(queue_item_id, queue_item_version, status="stale")
             except VersionConflictError:
                 # A concurrent user action (e.g. approve) already changed this
                 # row — never silently overwritten (KTD19); leave it as-is.
