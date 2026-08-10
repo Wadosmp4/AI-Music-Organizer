@@ -88,14 +88,12 @@ export function Settings() {
               status={authStatus.detection_path.status}
             />
             <StatusRow label="Last ingestion check" status={authStatus.youtube_detection.status} />
-            <StatusRow label="LLM BPM estimate" status={authStatus.llm_bpm_estimate.status} />
             <StatusRow
               label="LLM description match"
               status={authStatus.llm_description_match.status}
             />
             <StatusRow label="LLM playlist clustering" status={authStatus.llm_clustering.status} />
             <StatusRow label="Last.fm genre lookup" status={authStatus.lastfm.status} />
-            <StatusRow label="GetSongBPM tempo lookup" status={authStatus.getsongbpm.status} />
           </ul>
         )}
         {/* Plain <a> (full-page navigation), not a fetch: Google's consent

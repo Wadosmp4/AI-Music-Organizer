@@ -11,11 +11,9 @@ const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
   detection_path: { status: "ok", reason: null },
   youtube_detection: { status: "ok", reason: null },
-  llm_bpm_estimate: { status: "ok", reason: null },
   llm_description_match: { status: "ok", reason: null },
   llm_clustering: { status: "ok", reason: null },
   lastfm: { status: "ok", reason: null },
-  getsongbpm: { status: "ok", reason: null },
 };
 
 function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.ReviewQueueItem {
@@ -38,7 +36,33 @@ function makeItem(overrides: Partial<client.ReviewQueueItem> = {}): client.Revie
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(client.fetchPlaylists).mockResolvedValue([]);
+  // Polled unconditionally on every mount (no session id to gate it, unlike
+  // matching) -- every test needs a default so an unmocked call doesn't
+  // resolve to undefined and throw when the page reads its fields.
+  vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+    ingestion_status: "idle",
+    ingestion_processed_count: 0,
+    ingestion_total_count: 0,
+  });
+  // A session id written by one test must not leak into the next and get
+  // restored on mount unexpectedly (mirrors Onboarding.test.tsx).
+  localStorage.clear();
 });
+
+function makeReorganizeStatus(
+  overrides: Partial<client.ReorganizeStatus> = {},
+): client.ReorganizeStatus {
+  return {
+    session_id: 42,
+    clustering_status: "done",
+    proposals: [],
+    enriched_count: 0,
+    total_count: 0,
+    matching_status: "idle",
+    matched_count: 0,
+    ...overrides,
+  };
+}
 
 describe("ReviewQueue", () => {
   it("shows the playlist name in the section header, not just its id", async () => {
@@ -152,7 +176,7 @@ describe("ReviewQueue", () => {
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     vi.mocked(client.fetchPlaylists).mockResolvedValue([
-      { id: 20, name: "Chill", description: null, rule: null },
+      { id: 20, name: "Chill", description: null, rule: null, source: null },
     ]);
     // Same id back -- a reassignment of the existing row, not a new one.
     vi.mocked(client.addToPlaylist).mockResolvedValue({
@@ -183,8 +207,8 @@ describe("ReviewQueue", () => {
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     vi.mocked(client.fetchPlaylists).mockResolvedValue([
-      { id: 10, name: "Rock", description: null, rule: null },
-      { id: 20, name: "Chill", description: null, rule: null },
+      { id: 10, name: "Rock", description: null, rule: null, source: null },
+      { id: 20, name: "Chill", description: null, rule: null, source: null },
     ]);
     // A different id -- an independent second candidate row.
     vi.mocked(client.addToPlaylist).mockResolvedValue({
@@ -219,8 +243,8 @@ describe("ReviewQueue", () => {
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     vi.mocked(client.fetchPlaylists).mockResolvedValue([
-      { id: 10, name: "Rock", description: null, rule: null },
-      { id: 20, name: "Chill", description: null, rule: null },
+      { id: 10, name: "Rock", description: null, rule: null, source: null },
+      { id: 20, name: "Chill", description: null, rule: null, source: null },
     ]);
 
     render(<ReviewQueue />);
@@ -231,31 +255,75 @@ describe("ReviewQueue", () => {
     expect(select).toHaveTextContent("Chill");
   });
 
-  it("loads the next batch of songs and shows the result message", async () => {
+  it("triggers a background ingestion run and shows a completion message once it finishes", async () => {
     const item = makeItem();
     vi.mocked(client.fetchReviewQueue).mockResolvedValue([item]);
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     vi.mocked(client.checkForNewSongs).mockResolvedValue({
       ran: true,
-      mode: "steady_state",
-      new_songs_found: 2,
-      queue_items_created: 1,
-      backfill_complete: true,
+      mode: "triggered",
+      ingestion_status: "in_progress",
     });
 
     render(<ReviewQueue />);
     await screen.findByTestId("queue-item-1");
 
+    vi.mocked(client.fetchIngestionStatus).mockResolvedValueOnce({
+      ingestion_status: "done",
+      ingestion_processed_count: 2,
+      ingestion_total_count: 2,
+    });
+
     const user = userEvent.setup();
-    await user.click(screen.getByText("Load next 50 songs"));
+    await user.click(screen.getByText("Load new songs"));
 
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
-        "Loaded 2 new song(s), 1 added to review queue.",
+        "Loaded 2 new song(s) into the review queue.",
       );
     });
-    // The queue reloads after checking, on top of the initial mount fetch.
+    // The queue reloads once the run completes, on top of the initial mount fetch.
     expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows live ingestion progress while a background run is in progress", async () => {
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+      ingestion_status: "in_progress",
+      ingestion_processed_count: 30,
+      ingestion_total_count: 120,
+    });
+
+    render(<ReviewQueue />);
+
+    const progressBar = await screen.findByRole("progressbar", { name: "New song loading progress" });
+    expect(progressBar).toHaveAttribute("value", "30");
+    expect(progressBar).toHaveAttribute("max", "120");
+    expect(screen.getByText("30 / 120 songs (25%)")).toBeInTheDocument();
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+  });
+
+  it("shows a friendly message instead of triggering when onboarding isn't finished", async () => {
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.checkForNewSongs).mockResolvedValue({
+      ran: false,
+      mode: "waiting_for_onboarding",
+      ingestion_status: "idle",
+    });
+
+    render(<ReviewQueue />);
+    await screen.findByText("Nothing to review right now.");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Load new songs"));
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Finish onboarding before loading new songs.",
+      );
+    });
   });
 
   it("resets the backlog and reloads the queue after confirming", async () => {
@@ -274,7 +342,7 @@ describe("ReviewQueue", () => {
     expect(confirmSpy).toHaveBeenCalled();
     await waitFor(() => {
       expect(screen.getByRole("status")).toHaveTextContent(
-        'Reset 3 song(s) — click "Load next 50 songs" to start batching from the beginning again.',
+        'Reset 3 song(s) — click "Load new songs" to start batching from the beginning again.',
       );
     });
     expect(client.resetBacklog).toHaveBeenCalled();
@@ -325,26 +393,6 @@ describe("ReviewQueue", () => {
 
     await screen.findByTestId("detection-path-banner");
     expect(screen.queryByTestId("write-path-banner")).not.toBeInTheDocument();
-  });
-
-  it("renders the BPM attribution credit only for a measured-tempo item", async () => {
-    const measuredItem = makeItem({
-      id: 1,
-      explanation: { signal: "rule", detail: "bpm match", bpm: 128, bpm_source: "measured" },
-    });
-    const estimatedItem = makeItem({
-      id: 2,
-      library_item_id: 2,
-      explanation: { signal: "rule", detail: "bpm match", bpm: 90, bpm_source: "estimated" },
-    });
-    vi.mocked(client.fetchReviewQueue).mockResolvedValue([measuredItem, estimatedItem]);
-    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
-
-    render(<ReviewQueue />);
-
-    await screen.findByTestId("queue-item-1");
-    const attributions = screen.getAllByTestId("bpm-attribution");
-    expect(attributions).toHaveLength(1);
   });
 
   it("shows the reorganize session banner while a non-terminal session item exists, and hides it once it's terminal", async () => {
@@ -499,6 +547,71 @@ describe("ReviewQueue", () => {
 
     expect(client.cancelReorganize).not.toHaveBeenCalled();
     expect(screen.getByTestId("reorganize-session-banner")).toBeInTheDocument();
+
+    confirmSpy.mockRestore();
+  });
+
+  it("shows live matching progress for a session left running by Onboarding", async () => {
+    localStorage.setItem("yt-music-organizer:reorganizeSessionId", "42");
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue(
+      makeReorganizeStatus({ matching_status: "in_progress", matched_count: 25, total_count: 100 }),
+    );
+
+    render(<ReviewQueue />);
+
+    const progressBar = await screen.findByRole("progressbar", { name: "Library matching progress" });
+    expect(progressBar).toHaveAttribute("value", "25");
+    expect(progressBar).toHaveAttribute("max", "100");
+    expect(screen.getByText("25 / 100 songs (25%)")).toBeInTheDocument();
+    expect(client.fetchReorganizeStatus).toHaveBeenCalledWith(42);
+  });
+
+  it("hides the matching progress and reloads the queue once matching finishes", async () => {
+    localStorage.setItem("yt-music-organizer:reorganizeSessionId", "42");
+    const matchedItem = makeItem({ id: 1, reorganize_session_id: 42 });
+    vi.mocked(client.fetchReviewQueue)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([matchedItem]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue(
+      makeReorganizeStatus({ matching_status: "done", matched_count: 100, total_count: 100 }),
+    );
+
+    render(<ReviewQueue />);
+
+    await screen.findByTestId("queue-item-1");
+    expect(client.fetchReviewQueue).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId("matching-progress")).not.toBeInTheDocument();
+  });
+
+  it("stops tracking matching progress and clears the stored session id once it's cancelled", async () => {
+    localStorage.setItem("yt-music-organizer:reorganizeSessionId", "42");
+    const sessionItem = makeItem({ id: 1, status: "pending", reorganize_session_id: 42 });
+    vi.mocked(client.fetchReviewQueue)
+      .mockResolvedValueOnce([sessionItem])
+      .mockResolvedValueOnce([{ ...sessionItem, status: "rejected" }]);
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue(
+      makeReorganizeStatus({ matching_status: "in_progress", matched_count: 10, total_count: 50 }),
+    );
+    vi.mocked(client.cancelReorganize).mockResolvedValue({
+      session_id: 42,
+      clustering_status: "cancelled",
+    });
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<ReviewQueue />);
+    await screen.findByTestId("matching-progress");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Cancel session"));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("matching-progress")).not.toBeInTheDocument();
+    });
+    expect(localStorage.getItem("yt-music-organizer:reorganizeSessionId")).toBeNull();
 
     confirmSpy.mockRestore();
   });

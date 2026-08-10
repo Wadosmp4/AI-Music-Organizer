@@ -7,7 +7,9 @@ import {
   checkForNewSongs,
   fetchApplyStatus,
   fetchAuthStatus,
+  fetchIngestionStatus,
   fetchPlaylists,
+  fetchReorganizeStatus,
   fetchReviewQueue,
   rejectItem,
   resetBacklog,
@@ -17,8 +19,8 @@ import {
   type AuthStatus,
   type ReviewQueueItem,
 } from "../api/client";
-import { BpmAttribution } from "../components/BpmAttribution";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
+import { clearStoredReorganizeSessionId, getStoredReorganizeSessionId } from "../reorganizeSession";
 import { ALERT_BANNER } from "../styles";
 
 function groupByPlaylist(items: ReviewQueueItem[]): Map<number | null, ReviewQueueItem[]> {
@@ -71,6 +73,13 @@ function sleep(ms: number): Promise<void> {
 
 const APPLY_POLL_INTERVAL_MS = 1500;
 
+// Mirrors Onboarding's REORGANIZE_POLL_INTERVAL_MS -- how often this page
+// polls for matching progress once a reorganize session was left running by
+// Onboarding (U4 follow-up: matching now runs as its own background task, so
+// this page can pick up its progress independently of whichever page
+// triggered it).
+const MATCHING_POLL_INTERVAL_MS = 2000;
+
 export function ReviewQueue() {
   // Unfiltered result of the last fetch -- `items` (below) is the
   // pending-only subset actually rendered for review; the full set is kept
@@ -88,6 +97,72 @@ export function ReviewQueue() {
   const [applyResult, setApplyResult] = useState<ApplyLastResult | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const mountedRef = useRef(true);
+
+  // Live matching progress (U4 follow-up): the session id comes from
+  // localStorage rather than allItems/openReorganizeSessionId below, since
+  // matching can be triggered on Onboarding and this page mounted before any
+  // matched item exists yet to derive an "open session" from.
+  const [matchingSessionId, setMatchingSessionId] = useState<number | null>(null);
+  const [matchingStatus, setMatchingStatus] = useState("idle");
+  const [matchedCount, setMatchedCount] = useState(0);
+  const [matchingTotalCount, setMatchingTotalCount] = useState(0);
+  const matchingPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function stopMatchingPolling() {
+    if (matchingPollRef.current !== null) {
+      clearInterval(matchingPollRef.current);
+      matchingPollRef.current = null;
+    }
+  }
+
+  async function pollMatchingStatus(sessionId: number) {
+    const status = await fetchReorganizeStatus(sessionId);
+    if (!mountedRef.current) return status;
+    setMatchingStatus(status.matching_status);
+    setMatchedCount(status.matched_count);
+    setMatchingTotalCount(status.total_count);
+    if (status.matching_status === "done") {
+      stopMatchingPolling();
+      // New items may have landed since the last full queue load.
+      await loadQueue();
+    }
+    return status;
+  }
+
+  // Live ingestion-check progress: a background task now loops the "load
+  // new songs" batch to completion server-side (mirrors matching's own
+  // trigger+poll pattern) instead of the caller clicking "Load new songs"
+  // repeatedly. Unlike matching, there's no session id to track -- it's a
+  // single per-user status, so this page can always poll it on mount.
+  const [ingestionStatus, setIngestionStatus] = useState("idle");
+  const [ingestionProcessedCount, setIngestionProcessedCount] = useState(0);
+  const [ingestionTotalCount, setIngestionTotalCount] = useState(0);
+  const ingestionPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function stopIngestionPolling() {
+    if (ingestionPollRef.current !== null) {
+      clearInterval(ingestionPollRef.current);
+      ingestionPollRef.current = null;
+    }
+  }
+
+  async function pollIngestionStatus() {
+    const status = await fetchIngestionStatus();
+    if (!mountedRef.current) return status;
+    setIngestionStatus(status.ingestion_status);
+    setIngestionProcessedCount(status.ingestion_processed_count);
+    setIngestionTotalCount(status.ingestion_total_count);
+    if (status.ingestion_status === "done") {
+      stopIngestionPolling();
+      setCheckMessage(
+        status.ingestion_total_count > 0
+          ? `Loaded ${status.ingestion_total_count} new song(s) into the review queue.`
+          : "No new songs found.",
+      );
+      await loadQueue();
+    }
+    return status;
+  }
 
   const items = useMemo(() => allItems.filter((item) => item.status === "pending"), [allItems]);
 
@@ -123,22 +198,65 @@ export function ReviewQueue() {
   useEffect(() => {
     mountedRef.current = true;
     void loadQueue();
+
+    // Resume tracking a matching run left in progress by Onboarding (or a
+    // prior visit to this page) -- the background task itself never
+    // stopped, only whichever page's state was watching it.
+    const storedSessionId = getStoredReorganizeSessionId();
+    if (storedSessionId !== null) {
+      setMatchingSessionId(storedSessionId);
+      void pollMatchingStatus(storedSessionId)
+        .then((status) => {
+          if (!mountedRef.current || status === undefined) return;
+          if (status.matching_status === "in_progress") {
+            matchingPollRef.current = setInterval(
+              () => void pollMatchingStatus(storedSessionId),
+              MATCHING_POLL_INTERVAL_MS,
+            );
+          }
+        })
+        .catch(() => {
+          // Session no longer resolvable (e.g. deleted server-side) --
+          // stop treating it as trackable rather than polling a dead id.
+          if (mountedRef.current) setMatchingSessionId(null);
+        });
+    }
+
+    // Resume tracking an ingestion-check run left in progress -- same
+    // rationale, but there's no id to remember: it's always this user's one
+    // status, so just check it on every mount.
+    void pollIngestionStatus().then((status) => {
+      if (!mountedRef.current || status === undefined) return;
+      if (status.ingestion_status === "in_progress") {
+        ingestionPollRef.current = setInterval(
+          () => void pollIngestionStatus(),
+          MATCHING_POLL_INTERVAL_MS,
+        );
+      }
+    });
+
     return () => {
       mountedRef.current = false;
+      stopMatchingPolling();
+      stopIngestionPolling();
     };
   }, []);
 
   async function handleCheckForNewSongs() {
     setChecking(true);
+    setError(null);
     try {
       const result = await checkForNewSongs();
       if (!mountedRef.current) return;
-      setCheckMessage(
-        result.ran
-          ? `Loaded ${result.new_songs_found} new song(s), ${result.queue_items_created} added to review queue.`
-          : "Finish onboarding before loading new songs.",
-      );
-      await loadQueue();
+      if (!result.ran) {
+        setCheckMessage("Finish onboarding before loading new songs.");
+        return;
+      }
+      stopIngestionPolling();
+      ingestionPollRef.current = setInterval(() => void pollIngestionStatus(), MATCHING_POLL_INTERVAL_MS);
+      await pollIngestionStatus();
+    } catch (err) {
+      if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (mountedRef.current) setChecking(false);
     }
@@ -158,7 +276,7 @@ export function ReviewQueue() {
       const result = await resetBacklog();
       if (!mountedRef.current) return;
       setCheckMessage(
-        `Reset ${result.library_items_cleared} song(s) — click "Load next 50 songs" to start batching from the beginning again.`,
+        `Reset ${result.library_items_cleared} song(s) — click "Load new songs" to start batching from the beginning again.`,
       );
       await loadQueue();
     } finally {
@@ -248,6 +366,14 @@ export function ReviewQueue() {
     try {
       await cancelReorganize(openReorganizeSessionId);
       if (!mountedRef.current) return;
+      // Cancelling only rejects this session's items server-side -- an
+      // in-progress matching run keeps writing new ones in the background
+      // (see run_reorganize_matching), so stop tracking/displaying its
+      // progress here rather than showing a phantom banner for orphaned work.
+      stopMatchingPolling();
+      setMatchingSessionId(null);
+      setMatchingStatus("idle");
+      clearStoredReorganizeSessionId();
       await loadQueue();
     } catch (err) {
       if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
@@ -297,14 +423,56 @@ export function ReviewQueue() {
           </button>
           <button
             onClick={() => void handleCheckForNewSongs()}
-            disabled={checking}
+            disabled={checking || ingestionStatus === "in_progress"}
             className="rounded-full bg-slate-100 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50"
           >
-            {checking ? "Loading…" : "Load next 50 songs"}
+            {checking || ingestionStatus === "in_progress" ? "Loading…" : "Load new songs"}
           </button>
         </div>
       </div>
       <ConnectionHealthBanners authStatus={authStatus} />
+      {ingestionStatus === "in_progress" && ingestionTotalCount > 0 && (
+        <div
+          data-testid="ingestion-progress"
+          className="rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900"
+        >
+          <div className="flex items-center justify-between text-xs text-indigo-700">
+            <span>Loading new songs…</span>
+            <span>
+              {ingestionProcessedCount} / {ingestionTotalCount} songs (
+              {Math.round((ingestionProcessedCount / ingestionTotalCount) * 100)}%)
+            </span>
+          </div>
+          <progress
+            role="progressbar"
+            aria-label="New song loading progress"
+            className="mt-1 h-2 w-full accent-accent"
+            value={ingestionProcessedCount}
+            max={ingestionTotalCount}
+          />
+        </div>
+      )}
+      {matchingSessionId !== null && matchingStatus === "in_progress" && matchingTotalCount > 0 && (
+        <div
+          data-testid="matching-progress"
+          className="rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-900"
+        >
+          <div className="flex items-center justify-between text-xs text-indigo-700">
+            <span>Matching your library into playlists…</span>
+            <span>
+              {matchedCount} / {matchingTotalCount} songs (
+              {Math.round((matchedCount / matchingTotalCount) * 100)}%)
+            </span>
+          </div>
+          <progress
+            role="progressbar"
+            aria-label="Library matching progress"
+            className="mt-1 h-2 w-full accent-accent"
+            value={matchedCount}
+            max={matchingTotalCount}
+          />
+        </div>
+      )}
       {openReorganizeSessionId !== null && (
         <div
           data-testid="reorganize-session-banner"
@@ -409,7 +577,6 @@ export function ReviewQueue() {
                     : {item.explanation.detail}
                   </div>
                 )}
-                {item.explanation?.bpm_source === "measured" && <BpmAttribution />}
                 <div className="flex items-center gap-2 pt-1">
                   <button
                     onClick={() => void handleReject(item)}

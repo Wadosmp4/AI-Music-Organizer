@@ -8,8 +8,6 @@ const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 export interface ReviewQueueExplanation {
   signal: string;
   detail: string;
-  bpm?: number | null;
-  bpm_source?: "measured" | "estimated" | null;
   genre?: string | null;
 }
 
@@ -36,11 +34,9 @@ export interface AuthStatus {
   write_path: StatusEntry;
   detection_path: StatusEntry;
   youtube_detection: StatusEntry;
-  llm_bpm_estimate: StatusEntry;
   llm_description_match: StatusEntry;
   llm_clustering: StatusEntry;
   lastfm: StatusEntry;
-  getsongbpm: StatusEntry;
 }
 
 export interface PlaylistProposal {
@@ -58,6 +54,11 @@ export interface AddedPlaylist {
   name: string;
   description: string | null;
   rule: Record<string, unknown> | null;
+  // "proposal" | "custom" | "adopted" | null (rows created before this field
+  // existed) -- which Onboarding UI section this playlist originated from,
+  // so it can stay there (checked) instead of collapsing into the generic
+  // "Your YouTube Music playlists" list once it's a real playlist.
+  source: string | null;
 }
 
 // A real YouTube Music playlist the user already had before using this tool
@@ -78,10 +79,28 @@ export interface CreatedPlaylist {
   description: string | null;
 }
 
-export interface OnboardingAnalysis {
-  proposals: PlaylistProposal[];
+// Split into two calls -- /playlists (a DB query + a plain YouTube list,
+// fast) and /proposals (AI clustering, can take a long time for a big
+// library) -- so the frontend can render playlists immediately instead of
+// both being stuck behind the slow one on a single combined endpoint.
+export interface OnboardingPlaylists {
   existing_playlists: YouTubePlaylist[];
   added_playlists: AddedPlaylist[];
+}
+
+// /proposals is trigger+poll, not a plain GET (mirrors matching/ingestion):
+// generation runs as a background task (embed+HDBSCAN clustering + genre
+// enrichment, previously up to ~2 minutes of invisible work) so the caller
+// polls status/progress/results here instead of waiting on one long request.
+export interface OnboardingProposalsTrigger {
+  proposals_status: string;
+}
+
+export interface OnboardingProposalsStatus {
+  proposals_status: string;
+  proposals_processed_count: number;
+  proposals_total_count: number;
+  proposals: PlaylistProposal[];
 }
 
 // Carries the parsed JSON error body (when the response had one) alongside
@@ -175,8 +194,16 @@ export function createPlaylist(
   });
 }
 
-export function fetchOnboardingAnalysis(): Promise<OnboardingAnalysis> {
-  return request<OnboardingAnalysis>("/onboarding/analysis");
+export function fetchOnboardingPlaylists(): Promise<OnboardingPlaylists> {
+  return request<OnboardingPlaylists>("/onboarding/playlists");
+}
+
+export function triggerOnboardingProposals(): Promise<OnboardingProposalsTrigger> {
+  return request<OnboardingProposalsTrigger>("/onboarding/proposals", { method: "POST" });
+}
+
+export function fetchOnboardingProposals(): Promise<OnboardingProposalsStatus> {
+  return request<OnboardingProposalsStatus>("/onboarding/proposals");
 }
 
 // KTD7: a playlist id in `removedPlaylistIds` with non-terminal review work
@@ -227,14 +254,30 @@ export function asPlaylistRemovalConfirmation(err: unknown): PlaylistRemovalConf
   return null;
 }
 
-export function checkForNewSongs(): Promise<{
+// Triggers a background ingestion-check run (mirrors the reorganize
+// matching trigger's shape) -- loops the backend's own bounded batch to
+// completion server-side, instead of the caller clicking "Load new songs"
+// repeatedly. `mode` is "waiting_for_onboarding" | "triggered";
+// `ingestion_status` is "idle" | "in_progress" | "done", polled via
+// fetchIngestionStatus.
+export interface IngestionCheckTrigger {
   ran: boolean;
   mode: string;
-  new_songs_found: number;
-  queue_items_created: number;
-  backfill_complete: boolean;
-}> {
+  ingestion_status: string;
+}
+
+export function checkForNewSongs(): Promise<IngestionCheckTrigger> {
   return request("/ingestion/check", { method: "POST" });
+}
+
+export interface IngestionStatus {
+  ingestion_status: string;
+  ingestion_processed_count: number;
+  ingestion_total_count: number;
+}
+
+export function fetchIngestionStatus(): Promise<IngestionStatus> {
+  return request("/ingestion/status");
 }
 
 export function resetBacklog(): Promise<{ library_items_cleared: number }> {
@@ -261,6 +304,17 @@ export interface ReorganizeStatus {
   session_id: number;
   clustering_status: string;
   proposals: ReorganizeProposal[];
+  // Live enrichment progress: enriched_count trails total_count (the
+  // session's full snapshot size, known from the first poll) as the
+  // background job works through the library -- the slow, previously-
+  // invisible phase before any proposal ever lands.
+  enriched_count: number;
+  total_count: number;
+  // Live matching progress (U4 follow-up): matched_count trails total_count
+  // the same way, once matching has been triggered. matching_status is one
+  // of "idle" | "in_progress" | "done".
+  matching_status: string;
+  matched_count: number;
 }
 
 export function triggerReorganize(): Promise<ReorganizeTrigger> {
@@ -271,17 +325,18 @@ export function fetchReorganizeStatus(sessionId: number): Promise<ReorganizeStat
   return request<ReorganizeStatus>(`/onboarding/reorganize/${sessionId}`);
 }
 
-// U4: one session-scoped matching batch (R6/R7) -- same batch-and-click
-// shape as `checkForNewSongs`; the caller loops until `matching_complete`.
-export interface ReorganizeMatchResult {
-  ran: boolean;
-  processed: number;
-  queue_items_created: number;
-  matching_complete: boolean;
+// U4: matches the session's full snapshot against candidate playlists as a
+// background task (mirrors triggerReorganize's clustering pattern) -- poll
+// fetchReorganizeStatus for matching_status/matched_count instead of
+// looping batch calls from the browser (the loop used to die on tab close
+// or page navigation, and a slow batch could look "stuck" for minutes).
+export interface MatchTrigger {
+  session_id: number;
+  matching_status: string;
 }
 
-export function runReorganizeMatchBatch(sessionId: number): Promise<ReorganizeMatchResult> {
-  return request<ReorganizeMatchResult>(`/ingestion/reorganize/${sessionId}/match`, { method: "POST" });
+export function triggerReorganizeMatching(sessionId: number): Promise<MatchTrigger> {
+  return request<MatchTrigger>(`/onboarding/reorganize/${sessionId}/match`, { method: "POST" });
 }
 
 // U6: Finish & Apply (R9/R10/R11) -- creates any missing playlists and

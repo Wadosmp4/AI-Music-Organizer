@@ -11,11 +11,9 @@ const baseAuthStatus: client.AuthStatus = {
   write_path: { status: "ok", reason: null },
   detection_path: { status: "ok", reason: null },
   youtube_detection: { status: "ok", reason: null },
-  llm_bpm_estimate: { status: "ok", reason: null },
   llm_description_match: { status: "ok", reason: null },
   llm_clustering: { status: "ok", reason: null },
   lastfm: { status: "ok", reason: null },
-  getsongbpm: { status: "ok", reason: null },
 };
 
 beforeEach(() => {
@@ -49,7 +47,7 @@ describe("Settings", () => {
   it("submits the create-playlist form and shows the resulting message", async () => {
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     vi.mocked(client.createPlaylist).mockResolvedValue({
-      playlist: { id: 1, name: "Road Trip", description: null, rule: null },
+      playlist: { id: 1, name: "Road Trip", description: null, rule: null, source: null },
       review_queue_items_created: 3,
     });
 
