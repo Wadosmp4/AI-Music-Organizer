@@ -75,6 +75,17 @@ class ReorganizeMatchingResult:
     processed: int
     queue_items_created: int
     matching_complete: bool  # True once every snapshot video_id has been considered this session
+    # R14/KTD2: whether *this batch's own* get_liked_songs() call failed --
+    # a local signal, distinct from dependency_health_store's shared
+    # "youtube_detection" key. Reading that shared key at the point of
+    # failure races against jobs/ingestion.py's own concurrent writes to the
+    # same key (both jobs can run back-to-back from the same
+    # /onboarding/select request), so the caller's done-vs-failed decision
+    # is based on what this run itself actually observed, not whatever the
+    # global happens to say at the moment it's checked. `ran=False` alone is
+    # ambiguous between "session vanished" and "fetch failed" -- this field
+    # disambiguates.
+    fetch_failed: bool = False
 
 
 def run_reorganize_matching_batch(
@@ -98,18 +109,17 @@ def run_reorganize_matching_batch(
     try:
         liked_songs = music_client.get_liked_songs()
     except Exception as exc:
-        # R14/KTD2: mirrors jobs/ingestion.py's run_ingestion_check -- shares
-        # the same "youtube_detection" health key since it's the same
-        # underlying dependency, so run_reorganize_matching below can tell a
-        # genuine fetch failure apart from a batch that legitimately had
-        # nothing left to process.
+        # Still write the shared "youtube_detection" key (Settings/auth-status
+        # reads it for its own generic connection-health display), but the
+        # done-vs-failed decision in run_reorganize_matching below now uses
+        # this result's own fetch_failed field instead of re-reading it.
         dependency_health_store.set_status(
             "youtube_detection",
             DependencyStatus.DEGRADED,
             f"reorganize matching failed to fetch liked songs: {exc}",
         )
         return ReorganizeMatchingResult(
-            ran=False, processed=0, queue_items_created=0, matching_complete=False
+            ran=False, processed=0, queue_items_created=0, matching_complete=False, fetch_failed=True
         )
     dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
     songs_by_video_id = {s["videoId"]: s for s in liked_songs if s.get("videoId")}
@@ -317,10 +327,11 @@ def run_reorganize_matching(
             )
             if not result.ran:
                 # Session vanished (cancelled mid-run) or the liked-songs
-                # fetch failed. R14/KTD2: a degraded youtube_detection health
-                # signal with zero matched progress so far this run means a
-                # genuine failure -- write "failed" so the poll endpoint can
-                # surface it instead of leaving matching_status stuck at
+                # fetch failed. R14/KTD2: this run's own fetch_failed signal
+                # (not the shared, racy dependency_health_store read) with
+                # zero matched progress so far this run means a genuine
+                # failure -- write "failed" so the poll endpoint can surface
+                # it instead of leaving matching_status stuck at
                 # "in_progress" forever. Any other case (session gone, or a
                 # fetch failure after this run already made real progress)
                 # leaves matching_status untouched so a future trigger can
@@ -328,9 +339,7 @@ def run_reorganize_matching(
                 reorganize_session = reorganize_session_repo.get(reorganize_session_id)
                 if reorganize_session is None:
                     return
-                if dependency_health_store.failed_with_no_progress(
-                    "youtube_detection", reorganize_session.matched_count > 0
-                ):
+                if result.fetch_failed and reorganize_session.matched_count == 0:
                     reorganize_session.matching_status = "failed"
                     reorganize_session_repo.update(reorganize_session)
                 return

@@ -20,7 +20,11 @@ from app.api.deps import (
     get_reorganize_matching_dependencies,
 )
 from app.integrations.base import MusicServiceClient
-from app.jobs.ingestion import run_ingestion_check_to_completion
+from app.jobs.ingestion import (
+    IngestionAlreadyInProgressError,
+    run_ingestion_check_to_completion,
+    trigger_ingestion_check,
+)
 from app.jobs.reorganize_matching import (
     MatchingAlreadyInProgressError,
     run_reorganize_matching,
@@ -226,8 +230,21 @@ def select(
     # adding/removing a playlist). KTD8: complete_onboarding above already
     # handles both cases through the same call, so this single unconditional
     # trigger covers both without branching on whether onboarding was
-    # already completed.
-    background_tasks.add_task(run_ingestion_check_to_completion, user.id)
+    # already completed. Claims the same synchronous pre-flight
+    # `/ingestion/check` itself uses (trigger_ingestion_check) before
+    # scheduling the background task -- without it, `ingestion_status` never
+    # flips to "in_progress" for this trigger path, silently breaking both
+    # R10's live indicator and the double-run guard a manual "Load new
+    # songs" click relies on. A run already in progress (e.g. this is a
+    # later re-confirm while an earlier one is still going) isn't fatal to
+    # finishing setup -- swallow it the same way triggerReorganizeMatching's
+    # own best-effort call is treated on the frontend.
+    try:
+        trigger_ingestion_check(service.user_repository, user.id)
+    except IngestionAlreadyInProgressError:
+        pass
+    else:
+        background_tasks.add_task(run_ingestion_check_to_completion, user.id)
     return SelectionResponse(
         created_playlists=[
             CreatedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description)

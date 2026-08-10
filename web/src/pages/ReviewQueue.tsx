@@ -14,6 +14,7 @@ import {
   rejectItem,
   resetBacklog,
   triggerFinishAndApply,
+  triggerReorganizeMatching,
   type AddedPlaylist,
   type ApplyLastResult,
   type AuthStatus,
@@ -164,8 +165,10 @@ export function ReviewQueue() {
     setMatchingStatus(status.matching_status);
     setMatchedCount(status.matched_count);
     setMatchingTotalCount(status.total_count);
-    if (status.matching_status === "done") {
+    if (status.matching_status !== "in_progress") {
       stopMatchingPolling();
+    }
+    if (status.matching_status === "done") {
       // New items may have landed since the last full queue load.
       await loadQueue();
     }
@@ -195,8 +198,10 @@ export function ReviewQueue() {
     setIngestionStatus(status.ingestion_status);
     setIngestionProcessedCount(status.ingestion_processed_count);
     setIngestionTotalCount(status.ingestion_total_count);
-    if (status.ingestion_status === "done") {
+    if (status.ingestion_status !== "in_progress") {
       stopIngestionPolling();
+    }
+    if (status.ingestion_status === "done") {
       setCheckMessage(
         status.ingestion_total_count > 0
           ? `Loaded ${status.ingestion_total_count} new song(s) into the review queue.`
@@ -425,6 +430,27 @@ export function ReviewQueue() {
     }
   }
 
+  // R14/AE6: mirrors handleCheckForNewSongs's own retry -- a failed matching
+  // run leaves matching_status at "failed" rather than stuck "in_progress",
+  // so this simply re-triggers the same session's matching job and resumes
+  // polling it the same way the mount effect above does for a resumed run.
+  async function handleRetryMatching() {
+    if (matchingSessionId === null) return;
+    setError(null);
+    try {
+      await triggerReorganizeMatching(matchingSessionId);
+      if (!mountedRef.current) return;
+      setMatchingStatus("in_progress");
+      stopMatchingPolling();
+      matchingPollRef.current = setInterval(
+        () => void pollMatchingStatus(matchingSessionId),
+        MATCHING_POLL_INTERVAL_MS,
+      );
+    } catch (err) {
+      if (mountedRef.current) setError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   const groups = useMemo(() => groupByPlaylist(items), [items]);
   const groupEntries = useMemo(() => [...groups.entries()], [groups]);
 
@@ -609,6 +635,24 @@ export function ReviewQueue() {
             value={matchedCount}
             max={matchingTotalCount}
           />
+        </div>
+      )}
+      {/* R14/AE6: mirrors the ingestion-failed block above -- a matching
+          run that genuinely failed (not one that simply finished with
+          nothing left to match) leaves matching_status at "failed" instead
+          of hanging at "in_progress" forever. */}
+      {matchingSessionId !== null && matchingStatus === "failed" && (
+        <div
+          data-testid="matching-failed"
+          className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"
+        >
+          <p>Matching your library into playlists failed -- your YouTube connection may need attention.</p>
+          <button
+            onClick={() => void handleRetryMatching()}
+            className="mt-1 font-medium underline"
+          >
+            Try again
+          </button>
         </div>
       )}
       {openReorganizeSessionId !== null && (

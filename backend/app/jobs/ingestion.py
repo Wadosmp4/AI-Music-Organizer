@@ -62,6 +62,15 @@ class IngestionCheckResult:
     # stable "out of how many" denominator from its first call, the same way
     # Reorganize's total_count is captured once from its own full snapshot.
     total_new_songs_found: int = 0
+    # R14/KTD2: whether *this batch's own* get_liked_songs() call failed --
+    # a local signal, distinct from dependency_health_store's shared
+    # "youtube_detection" key. Reading that shared key at the end of a run
+    # races against reorganize_matching.py's own concurrent writes to the
+    # same key (both jobs can run back-to-back from the same
+    # /onboarding/select request), so the final done-vs-failed decision
+    # below is based on what this run itself actually observed, not
+    # whatever the global happens to say at the moment it's checked.
+    fetch_failed: bool = False
 
 
 def run_ingestion_check(
@@ -104,6 +113,7 @@ def run_ingestion_check(
             queue_items_created=0,
             songs_marked_removed=0,
             backfill_complete=False,
+            fetch_failed=True,
         )
     dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
 
@@ -313,6 +323,7 @@ def run_ingestion_check_to_completion(
         ]
 
         processed = 0
+        any_fetch_failed = False
         total_known = False
         while True:
             result = run_ingestion_check(
@@ -328,6 +339,7 @@ def run_ingestion_check_to_completion(
             )
             if not result.ran:
                 break
+            any_fetch_failed = any_fetch_failed or result.fetch_failed
 
             if not total_known:
                 # Captured once, from the first batch's pre-cap count -- a
@@ -350,11 +362,7 @@ def run_ingestion_check_to_completion(
                 # forever retrying the exact same call.
                 break
 
-        final_status = (
-            "failed"
-            if dependency_health_store.failed_with_no_progress("youtube_detection", processed > 0)
-            else "done"
-        )
+        final_status = "failed" if any_fetch_failed and processed == 0 else "done"
         user_repository.set_ingestion_progress(user_id, status=final_status)
 
 
