@@ -438,14 +438,21 @@ def test_onboarding_select_via_http_creates_playlist_via_music_client(
 ):
     _seed_default_user(session)
 
-    response = api_client.post(
-        "/api/v1/onboarding/select",
-        json={
-            "accepted_proposals": [{"name": "Chill Electronic", "theme": "Laid-back"}],
-            "custom_playlists": [],
-        },
-        headers=_CSRF_HEADERS,
-    )
+    # R4: select() now also fires a background ingestion-check run (see
+    # test_onboarding_select_via_http_triggers_background_ingestion_check
+    # below) -- patched here too, same reasoning as the ingestion trigger
+    # test's own comment, since TestClient runs background tasks
+    # synchronously and an unpatched call would hit the real database via
+    # get_engine().
+    with patch("app.api.v1.onboarding.run_ingestion_check_to_completion"):
+        response = api_client.post(
+            "/api/v1/onboarding/select",
+            json={
+                "accepted_proposals": [{"name": "Chill Electronic", "theme": "Laid-back"}],
+                "custom_playlists": [],
+            },
+            headers=_CSRF_HEADERS,
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -461,15 +468,16 @@ def test_onboarding_select_via_http_adopts_an_existing_youtube_playlist_without_
 ):
     user = _seed_default_user(session)
 
-    response = api_client.post(
-        "/api/v1/onboarding/select",
-        json={
-            "accepted_proposals": [],
-            "custom_playlists": [],
-            "adopted_playlists": [{"playlist_id": "yt-pre-existing", "name": "Road Trip"}],
-        },
-        headers=_CSRF_HEADERS,
-    )
+    with patch("app.api.v1.onboarding.run_ingestion_check_to_completion"):
+        response = api_client.post(
+            "/api/v1/onboarding/select",
+            json={
+                "accepted_proposals": [],
+                "custom_playlists": [],
+                "adopted_playlists": [{"playlist_id": "yt-pre-existing", "name": "Road Trip"}],
+            },
+            headers=_CSRF_HEADERS,
+        )
 
     assert response.status_code == 200
     body = response.json()
@@ -491,18 +499,68 @@ def test_onboarding_select_via_http_removes_an_unchecked_already_added_playlist(
     session.commit()
     session.refresh(playlist)
 
-    response = api_client.post(
-        "/api/v1/onboarding/select",
-        json={
-            "accepted_proposals": [],
-            "custom_playlists": [],
-            "removed_playlist_ids": [playlist.id],
-        },
-        headers=_CSRF_HEADERS,
-    )
+    with patch("app.api.v1.onboarding.run_ingestion_check_to_completion"):
+        response = api_client.post(
+            "/api/v1/onboarding/select",
+            json={
+                "accepted_proposals": [],
+                "custom_playlists": [],
+                "removed_playlist_ids": [playlist.id],
+            },
+            headers=_CSRF_HEADERS,
+        )
 
     assert response.status_code == 200
     assert PlaylistRepository(session).list_for_user(user.id) == []
+
+
+def test_onboarding_select_via_http_triggers_background_ingestion_check(
+    session, api_client, fake_music_client
+):
+    # R4: confirming playlist selection on Playlists must start library
+    # classification automatically -- no separate manual "Load new songs"
+    # action -- for first-time setup (this test) and for any later
+    # re-confirm (see the already-onboarded-user test below), per KTD8's
+    # single unconditional trigger inside complete_onboarding's own
+    # endpoint, mirroring trigger_proposals's add_task shape.
+    _seed_default_user(session)
+
+    with patch("app.api.v1.onboarding.run_ingestion_check_to_completion") as mock_run:
+        response = api_client.post(
+            "/api/v1/onboarding/select",
+            json={
+                "accepted_proposals": [{"name": "Chill Electronic", "theme": "Laid-back"}],
+                "custom_playlists": [],
+            },
+            headers=_CSRF_HEADERS,
+        )
+
+    assert response.status_code == 200
+    mock_run.assert_called_once_with(1)
+
+
+def test_onboarding_select_via_http_on_already_onboarded_user_also_triggers_ingestion_check(
+    session, api_client, fake_music_client
+):
+    # R4's later-visit extension: re-confirming selection (e.g. adding a
+    # playlist) after onboarding already completed must still auto-start
+    # classification -- KTD8 says complete_onboarding's single code path
+    # covers both cases with no first-time-vs-later branching.
+    user = _seed_default_user(session)
+    UserRepository(session).mark_onboarding_completed(user.id)
+
+    with patch("app.api.v1.onboarding.run_ingestion_check_to_completion") as mock_run:
+        response = api_client.post(
+            "/api/v1/onboarding/select",
+            json={
+                "accepted_proposals": [{"name": "Second Playlist", "theme": "Late addition"}],
+                "custom_playlists": [],
+            },
+            headers=_CSRF_HEADERS,
+        )
+
+    assert response.status_code == 200
+    mock_run.assert_called_once_with(user.id)
 
 
 # ---------------------------------------------------------------------------
