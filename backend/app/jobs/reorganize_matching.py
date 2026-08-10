@@ -27,6 +27,7 @@ from sqlmodel import Session
 
 from app.core.db import get_engine
 from app.integrations.base import MusicServiceClient
+from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.integrations.youtube_data_api_client import YouTubeDataApiClient, track_artist
 from app.models.library import LibraryItem
 from app.models.review_queue import ReviewQueueItem
@@ -96,10 +97,21 @@ def run_reorganize_matching_batch(
 
     try:
         liked_songs = music_client.get_liked_songs()
-    except Exception:
+    except Exception as exc:
+        # R14/KTD2: mirrors jobs/ingestion.py's run_ingestion_check -- shares
+        # the same "youtube_detection" health key since it's the same
+        # underlying dependency, so run_reorganize_matching below can tell a
+        # genuine fetch failure apart from a batch that legitimately had
+        # nothing left to process.
+        dependency_health_store.set_status(
+            "youtube_detection",
+            DependencyStatus.DEGRADED,
+            f"reorganize matching failed to fetch liked songs: {exc}",
+        )
         return ReorganizeMatchingResult(
             ran=False, processed=0, queue_items_created=0, matching_complete=False
         )
+    dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
     songs_by_video_id = {s["videoId"]: s for s in liked_songs if s.get("videoId")}
 
     existing_by_video_id = {
@@ -305,9 +317,21 @@ def run_reorganize_matching(
             )
             if not result.ran:
                 # Session vanished (cancelled mid-run) or the liked-songs
-                # fetch failed -- nothing more to do this pass; leave
-                # matching_status as "in_progress" rather than falsely
-                # marking done, so a future trigger picks it back up.
+                # fetch failed. R14/KTD2: a degraded youtube_detection health
+                # signal with zero matched progress so far this run means a
+                # genuine failure -- write "failed" so the poll endpoint can
+                # surface it instead of leaving matching_status stuck at
+                # "in_progress" forever. Any other case (session gone, or a
+                # fetch failure after this run already made real progress)
+                # leaves matching_status untouched so a future trigger can
+                # pick it back up.
+                reorganize_session = reorganize_session_repo.get(reorganize_session_id)
+                if reorganize_session is None:
+                    return
+                youtube_status, _ = dependency_health_store.get_status("youtube_detection")
+                if youtube_status == DependencyStatus.DEGRADED and reorganize_session.matched_count == 0:
+                    reorganize_session.matching_status = "failed"
+                    reorganize_session_repo.update(reorganize_session)
                 return
 
             reorganize_session = reorganize_session_repo.get(reorganize_session_id)

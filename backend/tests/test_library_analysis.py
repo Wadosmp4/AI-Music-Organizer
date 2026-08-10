@@ -214,8 +214,15 @@ def test_cluster_naming_empty_choices_list_surfaces_degraded_health_instead_of_r
     """An empty `choices` list (e.g. a safety-filtered response) raises
     IndexError on resp.choices[0] — previously outside the narrow except
     tuple, so it would have escaped _name_cluster entirely instead of being
-    treated like any other per-cluster naming failure (KTD18)."""
+    treated like any other per-cluster naming failure (KTD18).
+
+    R14/KTD2: this run made zero real progress (no proposal was ever
+    persisted) with llm_clustering left DEGRADED, so proposals_status must
+    end "failed", not "done" -- otherwise the poll endpoint has no way to
+    tell this genuinely broken run apart from one that just found nothing.
+    """
     user = _make_user(session)
+    user_repo = UserRepository(session)
     empty_choices_response = MagicMock()
     empty_choices_response.choices = []
     with (
@@ -229,6 +236,9 @@ def test_cluster_naming_empty_choices_list_surfaces_degraded_health_instead_of_r
     status, reason = dependency_health_store.get_status("llm_clustering")
     assert status == DependencyStatus.DEGRADED
     assert "clustering" in reason.lower()
+    assert user_repo.get(user.id).proposals_status == "failed"
+
+    dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
 
 
 def test_clustering_considers_songs_already_matched_to_an_existing_playlist(session):
@@ -268,8 +278,15 @@ def test_clustering_excludes_songs_no_longer_in_the_current_liked_library(sessio
     Exclusion is simply not fetching the song in the first place: proposals
     are generated from music_client.get_liked_songs()'s current result, not
     a locally-tracked "removed" flag, so an unliked song just isn't in the
-    list the trigger endpoint hands to run_propose_new_playlists."""
+    list the trigger endpoint hands to run_propose_new_playlists.
+
+    R14/KTD2 regression guard: this is the "legitimately found nothing"
+    case -- a healthy run (no LLM call was even made, so llm_clustering
+    can't be DEGRADED) that just has too few songs to cluster must still
+    end proposals_status == "done", not "failed"."""
     user = _make_user(session)
+    dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
+    user_repo = UserRepository(session)
 
     with patch("app.services.library_analysis.embed_texts", side_effect=_fake_embed_texts) as mock_embed:
         proposals = _run_propose(session, user.id, _FOUR_SONGS[1:])
@@ -277,6 +294,7 @@ def test_clustering_excludes_songs_no_longer_in_the_current_liked_library(sessio
     embedded_texts = mock_embed.call_args[0][0]
     assert not any("Song 1" in text for text in embedded_texts)
     assert proposals == []  # only 3 remaining songs, below MIN_CLUSTER_SIZE
+    assert user_repo.get(user.id).proposals_status == "done"
 
 
 def test_existing_playlist_style_is_passed_as_context_to_the_clustering_prompt(session):

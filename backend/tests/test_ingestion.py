@@ -893,6 +893,65 @@ def test_run_ingestion_check_to_completion_stops_once_steady_state_burst_is_drai
     assert len(library_repo.list_for_user(user.id)) == len(songs)
 
 
+def test_run_ingestion_check_to_completion_marks_failed_when_liked_songs_fetch_always_fails(session):
+    """R14/KTD2: a background run that never makes any real progress
+    because get_liked_songs() fails on every call must end ingestion_status
+    == "failed", not "done" -- otherwise the poll endpoint has no way to
+    distinguish a genuinely broken run from one that just found nothing."""
+    from app.jobs.ingestion import run_ingestion_check_to_completion
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist_repo.create(Playlist(user_id=user.id, name="Rock", description=None, rule=None))
+    music_client = MagicMock()
+    music_client.get_liked_songs.side_effect = RuntimeError("network error")
+    classification_service = _no_match_classification_service()
+
+    run_ingestion_check_to_completion(
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    fresh_user = user_repo.get(user.id)
+    assert fresh_user.ingestion_status == "failed"
+    assert len(library_repo.list_for_user(user.id)) == 0
+
+    dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
+
+
+def test_run_ingestion_check_to_completion_marks_done_when_fetch_is_healthy_but_finds_nothing(session):
+    """Regression guard: a run with a perfectly healthy fetch that simply
+    finds no new songs (everything already ingested) must still end
+    ingestion_status == "done", not "failed"."""
+    from app.jobs.ingestion import run_ingestion_check_to_completion
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist_repo.create(Playlist(user_id=user.id, name="Rock", description=None, rule=None))
+    dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
+
+    songs = [{"videoId": "v1", "title": "Song 1", "artists": [{"name": "Artist"}]}]
+    library_repo.create(LibraryItem(user_id=user.id, video_id="v1", title="Song 1", artist="Artist"))
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = songs
+    classification_service = _no_match_classification_service()
+
+    run_ingestion_check_to_completion(
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    fresh_user = user_repo.get(user.id)
+    assert fresh_user.ingestion_status == "done"
+    assert fresh_user.ingestion_processed_count == 0
+    status, _ = dependency_health_store.get_status("youtube_detection")
+    assert status == DependencyStatus.OK
+
+
 def test_reset_backlog_leaves_approved_pending_apply_songs_untouched(session):
     """U5/KTD3: a session-decided-but-unwritten item is a real decided state
     -- reset_backlog must not silently discard it."""
