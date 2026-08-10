@@ -350,16 +350,11 @@ def run_ingestion_check_to_completion(
                 # forever retrying the exact same call.
                 break
 
-        # R14/KTD2: distinguish a genuinely failed run from one that
-        # legitimately found nothing. youtube_detection is only DEGRADED
-        # here if the run's own get_liked_songs() calls failed (set inside
-        # run_ingestion_check above) -- a healthy fetch that simply finds no
-        # new songs leaves it OK, so that legitimate case still ends "done".
-        # A run that made some real progress before a later batch's fetch
-        # failed also stays "done" -- only a run with zero progress at all
-        # is reported as failed.
-        youtube_status, _ = dependency_health_store.get_status("youtube_detection")
-        final_status = "failed" if youtube_status == DependencyStatus.DEGRADED and processed == 0 else "done"
+        final_status = (
+            "failed"
+            if dependency_health_store.failed_with_no_progress("youtube_detection", processed > 0)
+            else "done"
+        )
         user_repository.set_ingestion_progress(user_id, status=final_status)
 
 

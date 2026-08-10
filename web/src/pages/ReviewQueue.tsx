@@ -526,7 +526,7 @@ export function ReviewQueue() {
 
   // Guided view (KD2): render only the current entry's group, not every
   // group -- destructured once here rather than inline in the JSX below.
-  const [currentPlaylistId, currentGroupItems] = currentEntry ?? [undefined, []];
+  const [currentPlaylistId, currentGroupItems] = currentEntry ?? [null, []];
 
   return (
     <div className="flex flex-col gap-4">
@@ -691,12 +691,12 @@ export function ReviewQueue() {
         >
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
             <h2 className="text-sm font-semibold text-slate-700">
-              {currentPlaylistId === null || currentPlaylistId === undefined
+              {currentPlaylistId === null
                 ? "Unassigned"
                 : (currentGroupItems[0]?.playlist_name ?? `Playlist #${currentPlaylistId}`)}
             </h2>
             <div className="flex gap-2">
-              {currentPlaylistId !== null && currentPlaylistId !== undefined && (
+              {currentPlaylistId !== null && (
                 <button
                   onClick={() => void handleApproveAll(currentGroupItems)}
                   className={`${PILL_BUTTON} bg-emerald-100 text-emerald-700 hover:bg-emerald-200`}
@@ -707,7 +707,7 @@ export function ReviewQueue() {
               {/* KD3/R7: explicit, per-playlist -- a playlist with many
                   pending items shouldn't block progress through the rest
                   of the guided sequence. */}
-              {currentPlaylistId !== null && currentPlaylistId !== undefined && (
+              {currentPlaylistId !== null && (
                 <button
                   onClick={handleSkipCurrent}
                   className={`${PILL_BUTTON} bg-slate-100 text-slate-600 hover:bg-slate-200`}

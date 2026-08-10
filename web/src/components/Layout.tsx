@@ -7,6 +7,9 @@ import {
   fetchReorganizeStatus,
   fetchReviewQueue,
   type AuthStatus,
+  type IngestionStatus,
+  type OnboardingProposalsStatus,
+  type ReorganizeStatus,
   type StatusEntry,
 } from "../api/client";
 import { getStoredReorganizeSessionId } from "../reorganizeSession";
@@ -138,15 +141,9 @@ export function Layout({
   // page's own polling of the same underlying statuses (mirrors the
   // authStatus effect above being independent of each page's own
   // fetchAuthStatus() call).
-  const [ingestionStatus, setIngestionStatus] = useState("idle");
-  const [ingestionProcessedCount, setIngestionProcessedCount] = useState(0);
-  const [ingestionTotalCount, setIngestionTotalCount] = useState(0);
-  const [proposalsStatus, setProposalsStatus] = useState("idle");
-  const [proposalsProcessedCount, setProposalsProcessedCount] = useState(0);
-  const [proposalsTotalCount, setProposalsTotalCount] = useState(0);
-  const [matchingStatus, setMatchingStatus] = useState("idle");
-  const [matchedCount, setMatchedCount] = useState(0);
-  const [matchingTotalCount, setMatchingTotalCount] = useState(0);
+  const [ingestion, setIngestion] = useState<IngestionStatus | null>(null);
+  const [proposals, setProposals] = useState<OnboardingProposalsStatus | null>(null);
+  const [matching, setMatching] = useState<ReorganizeStatus | null>(null);
   // Count of playlists with at least one pending review-queue item --
   // the "ready to review" signal (mirrors ReviewQueue's own groupByPlaylist
   // over pending items).
@@ -160,7 +157,7 @@ export function Layout({
       // one status per user) -- only worth polling if a reorganize session
       // was left running (mirrors ReviewQueue's own resume-on-mount check).
       const matchingSessionId = getStoredReorganizeSessionId();
-      const [ingestion, proposals, matching, queue] = await Promise.all([
+      const [ingestionResult, proposalsResult, matchingResult, queue] = await Promise.all([
         safeFetch(fetchIngestionStatus),
         safeFetch(fetchOnboardingProposals),
         matchingSessionId === null
@@ -169,21 +166,9 @@ export function Layout({
         safeFetch(fetchReviewQueue),
       ]);
       if (cancelled) return;
-      if (ingestion) {
-        setIngestionStatus(ingestion.ingestion_status);
-        setIngestionProcessedCount(ingestion.ingestion_processed_count);
-        setIngestionTotalCount(ingestion.ingestion_total_count);
-      }
-      if (proposals) {
-        setProposalsStatus(proposals.proposals_status);
-        setProposalsProcessedCount(proposals.proposals_processed_count);
-        setProposalsTotalCount(proposals.proposals_total_count);
-      }
-      if (matching) {
-        setMatchingStatus(matching.matching_status);
-        setMatchedCount(matching.matched_count);
-        setMatchingTotalCount(matching.total_count);
-      }
+      if (ingestionResult) setIngestion(ingestionResult);
+      if (proposalsResult) setProposals(proposalsResult);
+      if (matchingResult) setMatching(matchingResult);
       if (queue) {
         const pendingPlaylistIds = new Set(
           queue
@@ -203,15 +188,15 @@ export function Layout({
   }, []);
 
   const backgroundIndicator = computeBackgroundIndicator({
-    ingestionStatus,
-    ingestionProcessedCount,
-    ingestionTotalCount,
-    proposalsStatus,
-    proposalsProcessedCount,
-    proposalsTotalCount,
-    matchingStatus,
-    matchedCount,
-    matchingTotalCount,
+    ingestionStatus: ingestion?.ingestion_status ?? "idle",
+    ingestionProcessedCount: ingestion?.ingestion_processed_count ?? 0,
+    ingestionTotalCount: ingestion?.ingestion_total_count ?? 0,
+    proposalsStatus: proposals?.proposals_status ?? "idle",
+    proposalsProcessedCount: proposals?.proposals_processed_count ?? 0,
+    proposalsTotalCount: proposals?.proposals_total_count ?? 0,
+    matchingStatus: matching?.matching_status ?? "idle",
+    matchedCount: matching?.matched_count ?? 0,
+    matchingTotalCount: matching?.total_count ?? 0,
     pendingPlaylistCount,
   });
 

@@ -29,5 +29,17 @@ class _DependencyHealthStore:
         with self._lock:
             return self._status.get(name, (DependencyStatus.OK, None))
 
+    def failed_with_no_progress(self, name: str, made_progress: bool) -> bool:
+        """R14/KTD2: distinguish a genuinely failed run from one that
+        legitimately found/did nothing. A dependency is only DEGRADED here if
+        a real call against it failed during this run -- a healthy run that
+        simply has nothing to do leaves it OK, so that legitimate case still
+        counts as success. A run that made some progress before a later
+        failure also counts as success; only a run with zero progress at all
+        alongside a DEGRADED signal is a genuine failure.
+        """
+        status, _ = self.get_status(name)
+        return status == DependencyStatus.DEGRADED and not made_progress
+
 
 dependency_health_store = _DependencyHealthStore()

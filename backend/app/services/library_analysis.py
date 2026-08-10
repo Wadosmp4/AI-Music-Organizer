@@ -499,18 +499,10 @@ def run_propose_new_playlists(
             )
             proposals_created += 1
 
-        # R14/KTD2: distinguish a genuinely failed run from one that
-        # legitimately found no clusters. llm_clustering is only DEGRADED
-        # here if a naming call actually failed (set inside _name_cluster
-        # above) -- a healthy run that finds too few/no natural clusters
-        # (e.g. below MIN_CLUSTER_SIZE) never calls the LLM at all and
-        # leaves this OK, so that legitimate case still ends "done". A run
-        # where at least one cluster was successfully named also stays
-        # "done" even if a different cluster's naming failed -- only a run
-        # with zero proposals created at all is reported as failed.
-        llm_status, _ = dependency_health_store.get_status("llm_clustering")
         final_status = (
-            "failed" if llm_status == DependencyStatus.DEGRADED and proposals_created == 0 else "done"
+            "failed"
+            if dependency_health_store.failed_with_no_progress("llm_clustering", proposals_created > 0)
+            else "done"
         )
         user_repository.set_proposals_progress(user_id, status=final_status)
 

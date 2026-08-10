@@ -328,8 +328,9 @@ def run_reorganize_matching(
                 reorganize_session = reorganize_session_repo.get(reorganize_session_id)
                 if reorganize_session is None:
                     return
-                youtube_status, _ = dependency_health_store.get_status("youtube_detection")
-                if youtube_status == DependencyStatus.DEGRADED and reorganize_session.matched_count == 0:
+                if dependency_health_store.failed_with_no_progress(
+                    "youtube_detection", reorganize_session.matched_count > 0
+                ):
                     reorganize_session.matching_status = "failed"
                     reorganize_session_repo.update(reorganize_session)
                 return
