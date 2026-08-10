@@ -20,8 +20,17 @@ import {
   type ReviewQueueItem,
 } from "../api/client";
 import { ConnectionHealthBanners } from "../components/ConnectionHealthBanners";
+import {
+  addSkippedPlaylistId,
+  clearSkippedPlaylistIds,
+  clearStoredCurrentPlaylistId,
+  getSkippedPlaylistIds,
+  getStoredCurrentPlaylistId,
+  removeSkippedPlaylistId,
+  setStoredCurrentPlaylistId,
+} from "../organizeSkipState";
 import { clearStoredReorganizeSessionId, getStoredReorganizeSessionId } from "../reorganizeSession";
-import { ALERT_BANNER } from "../styles";
+import { ALERT_BANNER, CARD } from "../styles";
 
 function groupByPlaylist(items: ReviewQueueItem[]): Map<number | null, ReviewQueueItem[]> {
   const groups = new Map<number | null, ReviewQueueItem[]>();
@@ -32,6 +41,27 @@ function groupByPlaylist(items: ReviewQueueItem[]): Map<number | null, ReviewQue
     groups.set(key, existing);
   }
   return groups;
+}
+
+// KD2/KTD5: the guided sequence shows exactly one playlist's group at a
+// time, in groupByPlaylist's existing (creation/selection) order -- no new
+// sort. `pinnedPlaylistId` (set only by jumping to a playlist directly from
+// the revisit list) overrides that order when it still resolves to a live
+// group; otherwise the first entry not in the this-pass skip set wins. If
+// every remaining group has been skipped, skipping is never allowed to hide
+// all pending work forever -- fall back to the very first entry so the
+// sequence just cycles back to it.
+function pickCurrentEntry(
+  entries: [number | null, ReviewQueueItem[]][],
+  skippedPlaylistIds: Set<number>,
+  pinnedPlaylistId: number | null,
+): [number | null, ReviewQueueItem[]] | null {
+  if (pinnedPlaylistId !== null) {
+    const pinned = entries.find(([id]) => id === pinnedPlaylistId);
+    if (pinned) return pinned;
+  }
+  const firstUnskipped = entries.find(([id]) => id === null || !skippedPlaylistIds.has(id));
+  return firstUnskipped ?? entries[0] ?? null;
 }
 
 // Explicit thresholds, each branch a complete literal class string -- a
@@ -97,6 +127,19 @@ export function ReviewQueue() {
   const [applyResult, setApplyResult] = useState<ApplyLastResult | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const mountedRef = useRef(true);
+
+  // Guided one-playlist-at-a-time Organize view (U5/KTD3): this-pass's
+  // explicit skips, plus an optional pinned playlist id set only by jumping
+  // to a playlist directly from the "still pending" list below. Both are
+  // read from localStorage lazily on first render so a page switch (App.tsx
+  // unmounts whichever page isn't active) doesn't reset guided-review
+  // progress.
+  const [skippedPlaylistIds, setSkippedPlaylistIds] = useState<Set<number>>(() =>
+    getSkippedPlaylistIds(),
+  );
+  const [pinnedPlaylistId, setPinnedPlaylistId] = useState<number | null>(() =>
+    getStoredCurrentPlaylistId(),
+  );
 
   // Live matching progress (U4 follow-up): the session id comes from
   // localStorage rather than allItems/openReorganizeSessionId below, since
@@ -383,6 +426,72 @@ export function ReviewQueue() {
   }
 
   const groups = useMemo(() => groupByPlaylist(items), [items]);
+  const groupEntries = useMemo(() => [...groups.entries()], [groups]);
+
+  // R8: groupByPlaylist (above) already excludes any playlist with zero
+  // pending items and recomputes live on every poll/reload, so a playlist
+  // that just emptied out (or one that gained pending items again through
+  // ongoing use) simply appears/disappears from `groupEntries` on its own --
+  // no extra filtering needed here for the auto-skip/auto-recovery behavior.
+  const currentEntry = useMemo(
+    () => pickCurrentEntry(groupEntries, skippedPlaylistIds, pinnedPlaylistId),
+    [groupEntries, skippedPlaylistIds, pinnedPlaylistId],
+  );
+  const otherEntries = useMemo(
+    () => groupEntries.filter(([id]) => !currentEntry || id !== currentEntry[0]),
+    [groupEntries, currentEntry],
+  );
+
+  // A pinned jump target that no longer resolves to a live group (its last
+  // item was cleared while it was current, or some other tab/session
+  // resolved it) shouldn't keep squatting in localStorage -- left alone, it
+  // would wrongly resurrect itself as "current" if that same playlist later
+  // gains new pending items through ongoing use, even though the user
+  // already finished reviewing it.
+  useEffect(() => {
+    if (loading || pinnedPlaylistId === null) return;
+    if (!groups.has(pinnedPlaylistId)) {
+      clearStoredCurrentPlaylistId();
+      setPinnedPlaylistId(null);
+    }
+  }, [loading, pinnedPlaylistId, groups]);
+
+  // "This-pass" skip/pin state is scoped to a single sweep through the
+  // queue -- once every playlist is resolved (nothing pending anywhere),
+  // clear it so a future pass (e.g. after "Load new songs" finds more work)
+  // starts from the top again instead of carrying over stale skips.
+  useEffect(() => {
+    if (loading || items.length > 0) return;
+    if (skippedPlaylistIds.size === 0 && pinnedPlaylistId === null) return;
+    clearSkippedPlaylistIds();
+    clearStoredCurrentPlaylistId();
+    setSkippedPlaylistIds(new Set());
+    setPinnedPlaylistId(null);
+  }, [loading, items.length, skippedPlaylistIds, pinnedPlaylistId]);
+
+  // KD3/R7: defers the current playlist rather than forcing it clear first --
+  // it stays in the queue (and reachable via the "still pending" list below),
+  // just no longer the guided sequence's current stop until it's jumped to
+  // directly or every other playlist runs out.
+  function handleSkipCurrent() {
+    if (!currentEntry) return;
+    const [playlistId] = currentEntry;
+    if (playlistId === null) return; // Unassigned has no id to record a skip against.
+    addSkippedPlaylistId(playlistId);
+    setSkippedPlaylistIds(getSkippedPlaylistIds());
+    clearStoredCurrentPlaylistId();
+    setPinnedPlaylistId(null);
+  }
+
+  // Lets a skipped (or not-yet-reached) playlist be visited directly from
+  // the "still pending" list, overriding the normal creation-order sequence
+  // until it resolves or is skipped again.
+  function handleJumpToPlaylist(playlistId: number) {
+    removeSkippedPlaylistId(playlistId);
+    setSkippedPlaylistIds(getSkippedPlaylistIds());
+    setStoredCurrentPlaylistId(playlistId);
+    setPinnedPlaylistId(playlistId);
+  }
 
   // Titles for the apply-result banner's failed songs (falls back to just
   // the count in the JSX below if none of them are still in allItems).
@@ -409,10 +518,20 @@ export function ReviewQueue() {
     return map;
   }, [items]);
 
+  // R13: distinguishes "nothing pending, and the last load actually
+  // finished" from the plain generic empty state below (e.g. before
+  // onboarding is done, or mid-ingestion with no count in yet) -- this one
+  // gets its own explicit "you're done" framing instead.
+  const allCaughtUp = ingestionStatus === "done" && items.length === 0;
+
+  // Guided view (KD2): render only the current entry's group, not every
+  // group -- destructured once here rather than inline in the JSX below.
+  const [currentPlaylistId, currentGroupItems] = currentEntry ?? [undefined, []];
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-3">
-        <h1 className="text-2xl font-semibold text-slate-900">Review Queue</h1>
+        <h1 className="text-2xl font-semibold text-slate-900">Organize</h1>
         <div className="flex gap-2">
           <button
             onClick={() => void handleResetBacklog()}
@@ -450,6 +569,25 @@ export function ReviewQueue() {
             value={ingestionProcessedCount}
             max={ingestionTotalCount}
           />
+        </div>
+      )}
+      {/* R14: the backend now reports "failed" (rather than hanging or
+          silently reporting "done") for a genuinely failed run -- a healthy
+          fetch that simply finds nothing new still ends "done", so this only
+          fires when the run's own YouTube fetches actually broke. */}
+      {ingestionStatus === "failed" && (
+        <div
+          data-testid="ingestion-failed"
+          className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800"
+        >
+          <p>Loading new songs failed -- your YouTube connection may need attention.</p>
+          <button
+            onClick={() => void handleCheckForNewSongs()}
+            disabled={checking}
+            className="mt-1 font-medium underline disabled:opacity-50"
+          >
+            {checking ? "Loading…" : "Try again"}
+          </button>
         </div>
       )}
       {matchingSessionId !== null && matchingStatus === "in_progress" && matchingTotalCount > 0 && (
@@ -534,29 +672,53 @@ export function ReviewQueue() {
         </p>
       )}
       {loading && <p className="py-8 text-center text-sm text-slate-500">Loading…</p>}
-      {!loading && !error && items.length === 0 && (
+      {!loading && !error && allCaughtUp && (
+        <p
+          role="status"
+          data-testid="all-caught-up"
+          className="py-8 text-center text-sm text-slate-500"
+        >
+          You're all caught up — nothing pending review right now.
+        </p>
+      )}
+      {!loading && !error && !allCaughtUp && items.length === 0 && (
         <p className="py-8 text-center text-sm text-slate-500">Nothing to review right now.</p>
       )}
-      {[...groups.entries()].map(([playlistId, groupItems]) => (
+      {!loading && currentEntry && (
         <section
-          key={playlistId ?? "unassigned"}
+          key={currentPlaylistId ?? "unassigned"}
           className="rounded-2xl border border-slate-200 bg-white shadow-sm"
         >
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-3">
             <h2 className="text-sm font-semibold text-slate-700">
-              {playlistId === null ? "Unassigned" : (groupItems[0]?.playlist_name ?? `Playlist #${playlistId}`)}
+              {currentPlaylistId === null || currentPlaylistId === undefined
+                ? "Unassigned"
+                : (currentGroupItems[0]?.playlist_name ?? `Playlist #${currentPlaylistId}`)}
             </h2>
-            {playlistId !== null && (
-              <button
-                onClick={() => void handleApproveAll(groupItems)}
-                className={`${PILL_BUTTON} bg-emerald-100 text-emerald-700 hover:bg-emerald-200`}
-              >
-                Approve all ({groupItems.length})
-              </button>
-            )}
+            <div className="flex gap-2">
+              {currentPlaylistId !== null && currentPlaylistId !== undefined && (
+                <button
+                  onClick={() => void handleApproveAll(currentGroupItems)}
+                  className={`${PILL_BUTTON} bg-emerald-100 text-emerald-700 hover:bg-emerald-200`}
+                >
+                  Approve all ({currentGroupItems.length})
+                </button>
+              )}
+              {/* KD3/R7: explicit, per-playlist -- a playlist with many
+                  pending items shouldn't block progress through the rest
+                  of the guided sequence. */}
+              {currentPlaylistId !== null && currentPlaylistId !== undefined && (
+                <button
+                  onClick={handleSkipCurrent}
+                  className={`${PILL_BUTTON} bg-slate-100 text-slate-600 hover:bg-slate-200`}
+                >
+                  Skip for now
+                </button>
+              )}
+            </div>
           </div>
           <ul className="divide-y divide-slate-100">
-            {groupItems.map((item) => (
+            {currentGroupItems.map((item) => (
               <li
                 key={item.id}
                 data-testid={`queue-item-${item.id}`}
@@ -608,7 +770,35 @@ export function ReviewQueue() {
             ))}
           </ul>
         </section>
-      ))}
+      )}
+      {!loading && otherEntries.length > 0 && (
+        <section data-testid="organize-revisit-list" className={CARD}>
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Still pending review</h2>
+          <ul className="flex flex-col gap-2">
+            {otherEntries.map(([playlistId, groupItems]) => (
+              <li key={playlistId ?? "unassigned"}>
+                {playlistId === null ? (
+                  <div className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2 text-sm">
+                    <strong className="text-slate-900">Unassigned</strong>
+                    <span className="text-slate-500">{groupItems.length} pending</span>
+                  </div>
+                ) : (
+                  <button
+                    data-testid={`revisit-${playlistId}`}
+                    onClick={() => handleJumpToPlaylist(playlistId)}
+                    className="flex w-full items-center justify-between gap-3 rounded-xl border border-slate-200 px-3 py-2 text-left text-sm transition-colors hover:border-slate-300"
+                  >
+                    <strong className="text-slate-900">
+                      {groupItems[0]?.playlist_name ?? `Playlist #${playlistId}`}
+                    </strong>
+                    <span className="text-slate-500">{groupItems.length} pending</span>
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
     </div>
   );
 }
