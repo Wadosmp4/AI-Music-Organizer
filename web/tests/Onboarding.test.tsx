@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as client from "../src/api/client";
 import { Onboarding } from "../src/pages/Onboarding";
+import * as reorganizeSession from "../src/reorganizeSession";
 
 vi.mock("../src/api/client");
 
@@ -1079,5 +1080,79 @@ describe("Onboarding", () => {
 
     expect(client.fetchOnboardingProposals).not.toHaveBeenCalled();
     expect(client.triggerOnboardingProposals).not.toHaveBeenCalled();
+  });
+
+  it("clears a stale stored reorganize session reference and recovers onboarding's own proposals immediately (R15/KTD6)", async () => {
+    // Reproduces the observed bug: a browser-local reference to a Reorganize
+    // session that no longer resolves server-side (e.g. deleted, hence a
+    // 404) used to suppress onboarding's own suggestions forever -- nothing
+    // ever cleared the stale reference, and the "hasStoredSession" branch
+    // above had already opted out of generating onboarding's own proposals.
+    // The fix must both clear the dead reference AND fall back to
+    // triggering onboarding's own proposals for *this* mount, not just
+    // future ones.
+    localStorage.setItem("yt-music-organizer:reorganizeSessionId", "99");
+    vi.mocked(client.fetchOnboardingPlaylists).mockResolvedValue({
+      existing_playlists: [],
+      added_playlists: [],
+    });
+    vi.mocked(client.fetchReorganizeStatus).mockRejectedValue(new Error("404 Not Found"));
+    vi.mocked(client.fetchOnboardingProposals)
+      .mockResolvedValueOnce({
+        proposals_status: "idle",
+        proposals_processed_count: 0,
+        proposals_total_count: 0,
+        proposals: [],
+      })
+      .mockResolvedValue({
+        proposals_status: "done",
+        proposals_processed_count: 4,
+        proposals_total_count: 4,
+        proposals: [{ name: "Chill Vibes", theme: "lofi", song_count: 4, confidence: 1 }],
+      });
+    const clearSpy = vi.spyOn(reorganizeSession, "clearStoredReorganizeSessionId");
+
+    render(<Onboarding />);
+
+    // The current mount recovers on its own -- not just a future one.
+    expect(await screen.findByText("Chill Vibes")).toBeInTheDocument();
+    expect(clearSpy).toHaveBeenCalled();
+    expect(client.triggerOnboardingProposals).toHaveBeenCalledTimes(1);
+    expect(localStorage.getItem("yt-music-organizer:reorganizeSessionId")).toBeNull();
+
+    clearSpy.mockRestore();
+  });
+
+  it("does not clear or fall back when a stored reorganize session's status poll succeeds", async () => {
+    // Regression guard for the fix above: a session that still resolves
+    // fine server-side must keep suppressing onboarding's own proposal
+    // generation exactly as before -- only a dead reference triggers
+    // cleanup and recovery.
+    localStorage.setItem("yt-music-organizer:reorganizeSessionId", "7");
+    vi.mocked(client.fetchOnboardingPlaylists).mockResolvedValue({
+      existing_playlists: [],
+      added_playlists: [],
+    });
+    vi.mocked(client.fetchReorganizeStatus).mockResolvedValue({
+      session_id: 7,
+      clustering_status: "in_progress",
+      proposals: [{ name: "90s R&B", theme: "throwback grooves", song_count: 8 }],
+      enriched_count: 500,
+      total_count: 1000,
+      matching_status: "idle",
+      matched_count: 0,
+    });
+    const clearSpy = vi.spyOn(reorganizeSession, "clearStoredReorganizeSessionId");
+
+    render(<Onboarding />);
+
+    await screen.findByText("90s R&B", { exact: false });
+
+    expect(clearSpy).not.toHaveBeenCalled();
+    expect(client.fetchOnboardingProposals).not.toHaveBeenCalled();
+    expect(client.triggerOnboardingProposals).not.toHaveBeenCalled();
+    expect(localStorage.getItem("yt-music-organizer:reorganizeSessionId")).toBe("7");
+
+    clearSpy.mockRestore();
   });
 });

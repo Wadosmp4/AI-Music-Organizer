@@ -104,6 +104,41 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     }
   }
 
+  // U4/R15: shared by the two paths that need onboarding's own initial
+  // suggestions -- a normal first-ever mount with no stored session, and
+  // recovering mid-mount from a stale/dead stored session reference (see
+  // the pollReorganizeStatus catch below). Check current status first
+  // rather than always triggering -- a fresh trigger re-runs the whole
+  // clustering job from scratch, so a page the user has already visited
+  // before (proposals_status "done", or "in_progress" from an earlier
+  // visit still running) should just pick up what's already there/in
+  // flight instead of redoing it. Only a genuinely first-ever visit
+  // ("idle") kicks off a new run.
+  function triggerOwnProposalsIfIdle() {
+    void pollProposalsStatus().then((status) => {
+      if (!mountedRef.current || status === undefined) return;
+      if (status.proposals_status === "idle") {
+        void triggerOnboardingProposals()
+          .catch(() => {})
+          .then(() => pollProposalsStatus())
+          .then((polled) => {
+            if (!mountedRef.current || polled === undefined) return;
+            if (polled.proposals_status === "in_progress") {
+              proposalsPollRef.current = setInterval(
+                () => void pollProposalsStatus(),
+                PROPOSALS_POLL_INTERVAL_MS,
+              );
+            }
+          });
+      } else if (status.proposals_status === "in_progress") {
+        proposalsPollRef.current = setInterval(
+          () => void pollProposalsStatus(),
+          PROPOSALS_POLL_INTERVAL_MS,
+        );
+      }
+    });
+  }
+
   useEffect(() => {
     mountedRef.current = true;
     // Read once, synchronously, before either async call below resolves --
@@ -134,34 +169,7 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     // in that case, so skip generating them at all rather than running a
     // real (LLM-cost) background job for nothing.
     if (!hasStoredSession) {
-      // Check current status first rather than always triggering -- a fresh
-      // trigger re-runs the whole clustering job from scratch, so a page
-      // the user has already visited before (proposals_status "done", or
-      // "in_progress" from an earlier visit still running) should just pick
-      // up what's already there/in flight instead of redoing it. Only a
-      // genuinely first-ever visit ("idle") kicks off a new run.
-      void pollProposalsStatus().then((status) => {
-        if (!mountedRef.current || status === undefined) return;
-        if (status.proposals_status === "idle") {
-          void triggerOnboardingProposals()
-            .catch(() => {})
-            .then(() => pollProposalsStatus())
-            .then((polled) => {
-              if (!mountedRef.current || polled === undefined) return;
-              if (polled.proposals_status === "in_progress") {
-                proposalsPollRef.current = setInterval(
-                  () => void pollProposalsStatus(),
-                  PROPOSALS_POLL_INTERVAL_MS,
-                );
-              }
-            });
-        } else if (status.proposals_status === "in_progress") {
-          proposalsPollRef.current = setInterval(
-            () => void pollProposalsStatus(),
-            PROPOSALS_POLL_INTERVAL_MS,
-          );
-        }
-      });
+      triggerOwnProposalsIfIdle();
     } else {
       // Nothing to wait on in this branch -- treat it as immediately done
       // so the "no suggestions" empty state (gated on proposalsStatus ===
@@ -195,9 +203,18 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
         .catch(() => {
           // Session no longer resolvable (e.g. deleted server-side) --
           // stop treating it as open rather than polling a dead id forever.
+          // R15/KTD6: also recover onboarding's own suggestion generation
+          // for *this* mount, not just future ones -- the "hasStoredSession"
+          // branch above already opted out of it on the assumption this
+          // session's own proposals would take over, which they never will
+          // now that it's dead. Clearing the stored reference alone would
+          // leave this page load stuck showing no suggestions until the
+          // user reloads.
           if (mountedRef.current) {
             clearStoredReorganizeSessionId();
             setReorganizeSessionId(null);
+            setClusteringStatus("idle");
+            triggerOwnProposalsIfIdle();
           }
         });
     }
