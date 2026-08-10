@@ -18,7 +18,45 @@ const baseAuthStatus: client.AuthStatus = {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // U7: the background-status indicator polls these on every mount
+  // regardless of which test is exercising the nav shell -- default every
+  // source to idle/empty so tests that don't care about it aren't tripped
+  // up by an unmocked call resolving to `undefined`.
+  vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+    ingestion_status: "idle",
+    ingestion_processed_count: 0,
+    ingestion_total_count: 0,
+  });
+  vi.mocked(client.fetchOnboardingProposals).mockResolvedValue({
+    proposals_status: "idle",
+    proposals_processed_count: 0,
+    proposals_total_count: 0,
+    proposals: [],
+  });
+  vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+  // A session id left by one test must not leak into the next (mirrors
+  // ReviewQueue.test.tsx).
+  localStorage.clear();
 });
+
+function makeReviewQueueItem(
+  overrides: Partial<client.ReviewQueueItem> = {},
+): client.ReviewQueueItem {
+  return {
+    id: 1,
+    library_item_id: 1,
+    playlist_id: 10,
+    status: "pending",
+    version: 1,
+    confidence: 0.8,
+    explanation: null,
+    title: "Test Song",
+    artist: "Test Artist",
+    playlist_name: "Test Playlist",
+    reorganize_session_id: null,
+    ...overrides,
+  };
+}
 
 describe("Layout", () => {
   it("renders the app name, all three nav links in Playlists/Organize/Settings order, and the page content", async () => {
@@ -93,5 +131,75 @@ describe("Layout", () => {
       expect(screen.getByLabelText("Write path: degraded")).toBeInTheDocument();
     });
     expect(screen.getByLabelText("Detection path: needs reconnect")).toBeInTheDocument();
+  });
+
+  // R10/KTD4: the nav shell's own status indicator, independent of whichever
+  // page is mounted (here Settings, deliberately not Organize/Playlists) --
+  // it must reflect background classification progress regardless.
+  it("shows live progress for a background classification run, independent of which page is active", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+      ingestion_status: "in_progress",
+      ingestion_processed_count: 3,
+      ingestion_total_count: 10,
+    });
+
+    render(
+      <Layout page="settings" onPageChange={() => {}}>
+        <div>page content</div>
+      </Layout>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("background-status-indicator")).toHaveTextContent("3/10");
+    });
+  });
+
+  it("shows a failed state when a background status is the literal string \"failed\"", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+      ingestion_status: "failed",
+      ingestion_processed_count: 4,
+      ingestion_total_count: 10,
+    });
+
+    render(
+      <Layout page="playlists" onPageChange={() => {}}>
+        <div>page content</div>
+      </Layout>,
+    );
+
+    const indicator = await screen.findByTestId("background-status-indicator");
+    expect(indicator).toHaveTextContent(/failed/i);
+  });
+
+  it("renders no background-status indicator when everything is idle and nothing is pending review", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+    render(
+      <Layout page="organize" onPageChange={() => {}}>
+        <div>page content</div>
+      </Layout>,
+    );
+
+    await waitFor(() => expect(client.fetchAuthStatus).toHaveBeenCalled());
+    expect(screen.queryByTestId("background-status-indicator")).not.toBeInTheDocument();
+  });
+
+  it("shows a ready-to-review count once background work is done but items are pending", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.fetchReviewQueue).mockResolvedValue([
+      makeReviewQueueItem({ id: 1, playlist_id: 10 }),
+      makeReviewQueueItem({ id: 2, playlist_id: 20 }),
+    ]);
+
+    render(
+      <Layout page="settings" onPageChange={() => {}}>
+        <div>page content</div>
+      </Layout>,
+    );
+
+    const indicator = await screen.findByTestId("background-status-indicator");
+    expect(indicator).toHaveTextContent("2 playlists ready to review");
   });
 });
