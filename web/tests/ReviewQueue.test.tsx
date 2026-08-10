@@ -77,7 +77,10 @@ describe("ReviewQueue", () => {
     expect(screen.queryByText("Playlist #10")).not.toBeInTheDocument();
   });
 
-  it("falls back to the playlist id when no name is available, and labels unassigned songs", async () => {
+  it("falls back to the playlist id when no name is available, and labels unassigned songs in the revisit list", async () => {
+    // Guided one-at-a-time view (U5): with two groups pending, only the
+    // first (existing order) is the current stop -- the second (here,
+    // Unassigned) is only reachable via the "still pending" revisit list.
     const named = makeItem({ id: 1, playlist_id: 10, playlist_name: null });
     const unassigned = makeItem({
       id: 2,
@@ -92,7 +95,11 @@ describe("ReviewQueue", () => {
 
     await screen.findByTestId("queue-item-1");
     expect(screen.getByText("Playlist #10")).toBeInTheDocument();
-    expect(screen.getByText("Unassigned")).toBeInTheDocument();
+    expect(screen.queryByTestId("queue-item-2")).not.toBeInTheDocument();
+    // Unassigned isn't the current stop, but it's still visible as pending
+    // work in the revisit list rather than disappearing entirely.
+    const revisitList = screen.getByTestId("organize-revisit-list");
+    expect(revisitList).toHaveTextContent("Unassigned");
   });
 
   it("shows the song title and artist for each queue item", async () => {
@@ -230,12 +237,14 @@ describe("ReviewQueue", () => {
         'Added "Test Song" to Chill — awaiting its own approval.',
       );
     });
-    // Both the original (still under Rock) and the new candidate (under
-    // Chill) are visible -- neither was written or removed.
+    // Neither was written or removed: the original (still under Rock, the
+    // current guided stop) stays visible, and the new candidate (under
+    // Chill) still exists -- just deferred to the revisit list rather than
+    // shown as a second simultaneous stop (U5's guided one-at-a-time view).
     expect(screen.getByTestId("queue-item-1")).toBeInTheDocument();
-    expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+    expect(screen.queryByTestId("queue-item-2")).not.toBeInTheDocument();
     expect(screen.getByText("Rock")).toBeInTheDocument();
-    expect(screen.getByText("Chill")).toBeInTheDocument();
+    expect(screen.getByTestId("organize-revisit-list")).toHaveTextContent("Chill");
   });
 
   it("does not offer a song's own playlist as an add-to-playlist option", async () => {
@@ -614,5 +623,141 @@ describe("ReviewQueue", () => {
     expect(localStorage.getItem("yt-music-organizer:reorganizeSessionId")).toBeNull();
 
     confirmSpy.mockRestore();
+  });
+
+  describe("guided one-playlist-at-a-time Organize view (U5)", () => {
+    it("shows only the first playlist's group (existing order) when multiple playlists have pending items", async () => {
+      const first = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+      const second = makeItem({ id: 2, library_item_id: 2, playlist_id: 20, playlist_name: "Chill" });
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([first, second]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+      render(<ReviewQueue />);
+
+      await screen.findByTestId("queue-item-1");
+      expect(screen.getByText("Rock")).toBeInTheDocument();
+      expect(screen.queryByTestId("queue-item-2")).not.toBeInTheDocument();
+      // Chill isn't a rendered stop (no queue-item, no per-item actions) --
+      // it only shows up as pending work in the revisit list.
+      expect(screen.getByTestId("organize-revisit-list")).toHaveTextContent("Chill");
+    });
+
+    it('advances to the next unresolved playlist when "Skip for now" is clicked, and lists the skipped one in the revisit list', async () => {
+      const first = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+      const second = makeItem({ id: 2, library_item_id: 2, playlist_id: 20, playlist_name: "Chill" });
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([first, second]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+      render(<ReviewQueue />);
+      await screen.findByTestId("queue-item-1");
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText("Skip for now"));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Chill")).toBeInTheDocument();
+      expect(screen.queryByTestId("queue-item-1")).not.toBeInTheDocument();
+      // Rock was explicitly skipped -- it's not gone, just deferred.
+      expect(screen.getByTestId("organize-revisit-list")).toHaveTextContent("Rock");
+    });
+
+    it("advances to the next unresolved playlist the same way when the current playlist's last pending item is cleared (not just via explicit skip)", async () => {
+      const first = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+      const second = makeItem({ id: 2, library_item_id: 2, playlist_id: 20, playlist_name: "Chill" });
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([first, second]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+      vi.mocked(client.rejectItem).mockResolvedValue({ ...first, status: "rejected" });
+
+      render(<ReviewQueue />);
+      await screen.findByTestId("queue-item-1");
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText("Reject"));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Chill")).toBeInTheDocument();
+    });
+
+    it("never shows a playlist with zero pending items as a stop, even while other items reference other playlists", async () => {
+      const pending = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+      const noLongerPending = makeItem({
+        id: 2,
+        library_item_id: 2,
+        playlist_id: 30,
+        playlist_name: "Fully Approved",
+        status: "approved_pending_apply",
+      });
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([pending, noLongerPending]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+      render(<ReviewQueue />);
+
+      await screen.findByTestId("queue-item-1");
+      expect(screen.queryByText("Fully Approved")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("organize-revisit-list")).not.toBeInTheDocument();
+    });
+
+    it('jumps directly to a still-pending playlist when its revisit-list entry is clicked', async () => {
+      const first = makeItem({ id: 1, playlist_id: 10, playlist_name: "Rock" });
+      const second = makeItem({ id: 2, library_item_id: 2, playlist_id: 20, playlist_name: "Chill" });
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([first, second]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+
+      render(<ReviewQueue />);
+      await screen.findByTestId("queue-item-1");
+
+      const user = userEvent.setup();
+      await user.click(screen.getByTestId("revisit-20"));
+
+      await waitFor(() => {
+        expect(screen.getByTestId("queue-item-2")).toBeInTheDocument();
+      });
+      expect(screen.getByText("Chill")).toBeInTheDocument();
+      expect(screen.getByTestId("organize-revisit-list")).toHaveTextContent("Rock");
+    });
+
+    it('shows the "all caught up" state, not a group list, when ingestion is done and nothing is pending anywhere', async () => {
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+      vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+        ingestion_status: "done",
+        ingestion_processed_count: 5,
+        ingestion_total_count: 5,
+      });
+
+      render(<ReviewQueue />);
+
+      await screen.findByTestId("all-caught-up");
+      expect(screen.queryByText("Nothing to review right now.")).not.toBeInTheDocument();
+    });
+
+    it("shows an error/retry state when ingestion has failed, and the retry action re-triggers a check", async () => {
+      vi.mocked(client.fetchReviewQueue).mockResolvedValue([]);
+      vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+      vi.mocked(client.fetchIngestionStatus).mockResolvedValue({
+        ingestion_status: "failed",
+        ingestion_processed_count: 0,
+        ingestion_total_count: 0,
+      });
+      vi.mocked(client.checkForNewSongs).mockResolvedValue({
+        ran: true,
+        mode: "triggered",
+        ingestion_status: "in_progress",
+      });
+
+      render(<ReviewQueue />);
+
+      await screen.findByTestId("ingestion-failed");
+      expect(screen.queryByTestId("all-caught-up")).not.toBeInTheDocument();
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText("Try again"));
+
+      expect(client.checkForNewSongs).toHaveBeenCalled();
+    });
   });
 });
