@@ -20,6 +20,7 @@ from app.api.deps import (
     get_reorganize_matching_dependencies,
 )
 from app.integrations.base import MusicServiceClient
+from app.jobs.ingestion import run_ingestion_check_to_completion
 from app.jobs.reorganize_matching import (
     MatchingAlreadyInProgressError,
     run_reorganize_matching,
@@ -196,6 +197,7 @@ def get_proposals_status(
 @router.post("/select", response_model=SelectionResponse)
 def select(
     body: SelectionRequest,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_default_user),
     service: LibraryAnalysisService = Depends(get_library_analysis_service),
 ) -> SelectionResponse:
@@ -218,6 +220,14 @@ def select(
                 "pending_count": exc.pending_count,
             },
         )
+    # R4: confirming playlist selection here must automatically start
+    # library classification -- no separate manual "Load new songs" action
+    # -- for both first-time setup and any later re-confirm (e.g.
+    # adding/removing a playlist). KTD8: complete_onboarding above already
+    # handles both cases through the same call, so this single unconditional
+    # trigger covers both without branching on whether onboarding was
+    # already completed.
+    background_tasks.add_task(run_ingestion_check_to_completion, user.id)
     return SelectionResponse(
         created_playlists=[
             CreatedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description)
