@@ -10,18 +10,18 @@ from dataclasses import dataclass
 from fastapi import Depends
 from sqlmodel import Session
 
-from app.core.config import get_settings
 from app.core.db import get_session
 from app.integrations.base import MusicServiceClient
 from app.integrations.youtube_data_api_client import YouTubeDataApiClient
 from app.models.user import User
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
+from app.repositories.onboarding_proposal_repository import OnboardingProposalRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
-from app.services.bpm_lookup import BpmLookupService
+from app.repositories.vector_repository import QdrantVectorRepository, get_vector_repository
 from app.services.classification import ClassificationService
 from app.services.genre_lookup import GenreLookupService
 from app.services.library_analysis import LibraryAnalysisService
@@ -71,12 +71,9 @@ def get_review_queue_service(
 
 def get_classification_service(session: Session = Depends(get_session)) -> ClassificationService:
     genre_lookup = GenreLookupService(session)
-    bpm_lookup = BpmLookupService()
     # Wired in so callers that pass user_id benefit from U7's correction
     # feedback; harmless to callers that don't (defaults to no boost).
-    return ClassificationService(
-        genre_lookup, bpm_lookup, correction_log_repo=CorrectionLogRepository(session)
-    )
+    return ClassificationService(genre_lookup, correction_log_repo=CorrectionLogRepository(session))
 
 
 def get_playlist_creation_service(
@@ -93,9 +90,14 @@ def get_playlist_creation_service(
     )
 
 
+def get_vector_repository_dep() -> QdrantVectorRepository:
+    return get_vector_repository()
+
+
 def get_library_analysis_service(
     session: Session = Depends(get_session),
     music_client: MusicServiceClient = Depends(get_music_client),
+    vector_repository: QdrantVectorRepository = Depends(get_vector_repository_dep),
 ) -> LibraryAnalysisService:
     return LibraryAnalysisService(
         library_repository=LibraryRepository(session),
@@ -104,8 +106,8 @@ def get_library_analysis_service(
         user_repository=UserRepository(session),
         music_client=music_client,
         reorganize_session_repository=ReorganizeSessionRepository(session),
-        genre_lookup=GenreLookupService(session),
-        openrouter_api_key=get_settings().openrouter_api_key,
+        onboarding_proposal_repository=OnboardingProposalRepository(session),
+        vector_repository=vector_repository,
     )
 
 

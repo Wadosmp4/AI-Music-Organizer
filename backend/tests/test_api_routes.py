@@ -7,12 +7,14 @@ each router's own except-Exception -> 502 fallback were completely
 unverified end-to-end.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_music_client, get_session
+from qdrant_client import QdrantClient
+
+from app.api.deps import get_music_client, get_session, get_vector_repository_dep
 from app.integrations.auth_status import AuthStatus, auth_status_store
 from app.integrations.base import MusicServiceClient
 from app.main import app
@@ -22,6 +24,7 @@ from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.user_repository import UserRepository
+from app.repositories.vector_repository import QdrantVectorRepository
 
 # The backend's CSRF guard (app/main.py) requires this on every mutating
 # request — a plain TestClient POST with no headers is indistinguishable
@@ -42,8 +45,14 @@ def api_client(session, fake_music_client):
     def _get_session_override():
         yield session
 
+    def _get_vector_repository_override():
+        repo = QdrantVectorRepository(QdrantClient(":memory:"))
+        repo.ensure_collection()
+        return repo
+
     app.dependency_overrides[get_session] = _get_session_override
     app.dependency_overrides[get_music_client] = lambda: fake_music_client
+    app.dependency_overrides[get_vector_repository_dep] = _get_vector_repository_override
     try:
         yield TestClient(app)
     finally:
@@ -292,17 +301,41 @@ def test_ingestion_check_via_http_is_gated_until_onboarding_completes(
     fake_music_client.get_liked_songs.assert_not_called()
 
 
-def test_ingestion_check_via_http_reports_no_new_songs(session, api_client, fake_music_client):
+def test_ingestion_check_via_http_triggers_a_background_run(session, api_client, fake_music_client):
     user = _seed_default_user(session)
     UserRepository(session).mark_onboarding_completed(user.id)
     fake_music_client.get_liked_songs.return_value = []
 
-    response = api_client.post("/api/v1/ingestion/check", headers=_CSRF_HEADERS)
+    # TestClient runs background tasks synchronously as part of the request
+    # -- without this patch, run_ingestion_check_to_completion would run for
+    # real with no engine override and fall back to get_engine()'s real
+    # database_url (there's no test-level override for it, unlike get_session
+    # above), which would hit the actual app database instead of this test's
+    # isolated one. Patched at its import site in the endpoint module, same
+    # as any other dependency substitution.
+    with patch("app.api.v1.ingestion.run_ingestion_check_to_completion") as mock_run:
+        response = api_client.post("/api/v1/ingestion/check", headers=_CSRF_HEADERS)
 
     assert response.status_code == 200
     body = response.json()
     assert body["ran"] is True
-    assert body["new_songs_found"] == 0
+    assert body["mode"] == "triggered"
+    assert body["ingestion_status"] == "in_progress"
+    mock_run.assert_called_once_with(user.id)
+
+
+def test_ingestion_status_via_http_reports_progress(session, api_client):
+    user = _seed_default_user(session)
+    UserRepository(session).mark_onboarding_completed(user.id)
+    UserRepository(session).set_ingestion_progress(user.id, status="in_progress", processed=12, total=40)
+
+    response = api_client.get("/api/v1/ingestion/status")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ingestion_status"] == "in_progress"
+    assert body["ingestion_processed_count"] == 12
+    assert body["ingestion_total_count"] == 40
 
 
 def test_ingestion_reset_via_http_clears_uncommitted_songs_and_reopens_backfill(
@@ -334,22 +367,22 @@ def test_ingestion_reset_via_http_clears_uncommitted_songs_and_reopens_backfill(
 # ---------------------------------------------------------------------------
 
 
-def test_onboarding_analysis_via_http_lists_added_playlists(session, api_client):
+def test_onboarding_playlists_via_http_lists_added_playlists(session, api_client):
     user = _seed_default_user(session)
-    playlist = Playlist(user_id=user.id, name="Existing", description="already here")
+    playlist = Playlist(user_id=user.id, name="Existing", description="already here", source="custom")
     session.add(playlist)
     session.commit()
 
-    response = api_client.get("/api/v1/onboarding/analysis")
+    response = api_client.get("/api/v1/onboarding/playlists")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["proposals"] == []  # no openrouter_api_key configured in tests
     assert len(body["added_playlists"]) == 1
     assert body["added_playlists"][0]["name"] == "Existing"
+    assert body["added_playlists"][0]["source"] == "custom"
 
 
-def test_onboarding_analysis_via_http_lists_youtube_playlists_not_yet_added(
+def test_onboarding_playlists_via_http_lists_youtube_playlists_not_yet_added(
     session, api_client, fake_music_client
 ):
     user = _seed_default_user(session)
@@ -364,11 +397,40 @@ def test_onboarding_analysis_via_http_lists_youtube_playlists_not_yet_added(
         {"playlistId": "yt-pre-existing", "title": "Road Trip"},
     ]
 
-    response = api_client.get("/api/v1/onboarding/analysis")
+    response = api_client.get("/api/v1/onboarding/playlists")
 
     assert response.status_code == 200
     body = response.json()
     assert body["existing_playlists"] == [{"playlist_id": "yt-pre-existing", "title": "Road Trip"}]
+
+
+def test_onboarding_proposals_status_via_http_starts_idle_and_empty(session, api_client):
+    # Split from /playlists (AI clustering, can be slow for a big library) so
+    # the frontend isn't blocked on this before showing anything at all.
+    _seed_default_user(session)
+
+    response = api_client.get("/api/v1/onboarding/proposals")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["proposals_status"] == "idle"
+    assert body["proposals"] == []
+
+
+def test_onboarding_proposals_trigger_via_http_starts_a_background_run(session, api_client):
+    _seed_default_user(session)
+
+    # TestClient runs background tasks synchronously as part of the request
+    # -- without this patch, run_propose_new_playlists would run for real
+    # with no engine override and fall back to get_engine()'s real
+    # database_url, hitting the actual app database instead of this test's
+    # isolated one (same risk as the ingestion trigger test above).
+    with patch("app.api.v1.onboarding.run_propose_new_playlists") as mock_run:
+        response = api_client.post("/api/v1/onboarding/proposals", headers=_CSRF_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json()["proposals_status"] == "in_progress"
+    mock_run.assert_called_once()
 
 
 def test_onboarding_select_via_http_creates_playlist_via_music_client(

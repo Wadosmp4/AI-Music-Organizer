@@ -19,10 +19,13 @@ class Settings(BaseSettings):
     yt_data_api_redirect_uri: str = "http://localhost:8000/api/v1/auth/youtube/callback"
     yt_data_api_token_file: str = "data/yt_data_token.json"
 
-    # Classification hot-path externals (KTD9, KTD18).
+    # Classification hot-path externals (KTD18).
     lastfm_api_key: str = ""
-    getsongbpm_api_key: str = ""
     openrouter_api_key: str = ""
+
+    # Vector store for track embeddings (clustering) -- decoupled service,
+    # not the primary datastore (that's database_url/SQLite).
+    qdrant_url: str = "http://localhost:6333"
 
 
 @lru_cache

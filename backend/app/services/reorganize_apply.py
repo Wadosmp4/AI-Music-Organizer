@@ -126,11 +126,21 @@ def _write_item(
     music_client: MusicServiceClient,
     item,
     youtube_playlist_id: str,
+    existing_video_ids: set[str],
 ) -> bool:
     """Mirrors ReviewQueueService.approve()'s write_pending -> external call
     -> CAS-to-final-status sequence (KTD-shared machinery), but hardcoded
     for the apply path: these items are already known session-tagged and
-    approved_pending_apply, so there's no session-branch check to make."""
+    approved_pending_apply, so there's no session-branch check to make.
+
+    `existing_video_ids` is this playlist's current YouTube membership,
+    fetched once per playlist by the caller (not here) -- if the song is
+    already in there (e.g. added outside this app, or by an earlier partial
+    apply run that succeeded on YouTube but didn't get to record it before a
+    crash), the write is skipped rather than creating a real duplicate track
+    on the playlist; the item is still marked approved either way, since the
+    end state -- the song correctly placed in the playlist -- is the same.
+    """
     library_item = library_repository.get(item.library_item_id)
     if library_item is None:
         return False
@@ -139,6 +149,13 @@ def _write_item(
         pending_item = review_queue_repository.update(item.id, item.version, status="write_pending")
     except VersionConflictError:
         return False
+
+    if library_item.video_id in existing_video_ids:
+        try:
+            review_queue_repository.update(pending_item.id, pending_item.version, status="approved")
+        except VersionConflictError:
+            pass
+        return True
 
     try:
         music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
@@ -181,6 +198,10 @@ def _apply_approved_items(
     # KTD6: create each missing playlist's real YouTube counterpart exactly
     # once per run, memoized here, regardless of how many items target it.
     playlist_youtube_ids: dict[int, Optional[str]] = {}
+    # This playlist's current YouTube membership, fetched once per playlist
+    # (not once per item) -- amortizes the cost of the duplicate-prevention
+    # check in _write_item across every item that targets the same playlist.
+    playlist_video_ids: dict[int, set[str]] = {}
     for playlist_id in playlist_ids:
         playlist = playlist_repository.get(playlist_id)
         if playlist is None:
@@ -188,14 +209,26 @@ def _apply_approved_items(
             continue
         if playlist.youtube_playlist_id:
             playlist_youtube_ids[playlist_id] = playlist.youtube_playlist_id
-            continue
+        else:
+            try:
+                youtube_playlist_id = music_client.create_playlist(playlist.name, playlist.description or "")
+            except Exception:
+                playlist_youtube_ids[playlist_id] = None  # this playlist's items stay pending, reported failed
+                continue
+            playlist_repository.set_youtube_playlist_id(playlist_id, youtube_playlist_id)
+            playlist_youtube_ids[playlist_id] = youtube_playlist_id
+
+        youtube_playlist_id = playlist_youtube_ids[playlist_id]
         try:
-            youtube_playlist_id = music_client.create_playlist(playlist.name, playlist.description or "")
+            tracks = music_client.get_playlist_tracks(youtube_playlist_id)
+            playlist_video_ids[playlist_id] = {
+                t["videoId"] for t in tracks if t.get("videoId")
+            }
         except Exception:
-            playlist_youtube_ids[playlist_id] = None  # this playlist's items stay pending, reported failed
-            continue
-        playlist_repository.set_youtube_playlist_id(playlist_id, youtube_playlist_id)
-        playlist_youtube_ids[playlist_id] = youtube_playlist_id
+            # Fail open: if we can't confirm current membership, don't block
+            # the write over it -- this check is a safety net on top of the
+            # DB-level dedup (active_pairs_for_user), not the only guard.
+            playlist_video_ids[playlist_id] = set()
 
     succeeded = 0
     failed = 0
@@ -208,7 +241,10 @@ def _apply_approved_items(
             failed += 1
             failed_item_ids.append(item.id)
             continue
-        if _write_item(review_queue_repository, library_repository, music_client, item, youtube_playlist_id):
+        existing_video_ids = playlist_video_ids.get(item.playlist_id, set())
+        if _write_item(
+            review_queue_repository, library_repository, music_client, item, youtube_playlist_id, existing_video_ids
+        ):
             succeeded += 1
         else:
             failed += 1

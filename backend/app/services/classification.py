@@ -20,13 +20,16 @@ the playlist the user actually moved the song *to*. This only shifts
 items, and it never touches a ruled playlist's outcome (KTD10 untouched).
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
 import litellm
 from litellm import completion
 from pydantic import BaseModel
+from sqlmodel import Session
 
+from app.core.config import get_settings
 from app.integrations.base import MusicServiceClient, Track
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.integrations.http_client import CircuitBreaker, call_with_retry
@@ -34,7 +37,6 @@ from app.integrations.youtube_data_api_client import artist_bucket_key, track_ar
 from app.models.playlist import Playlist
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.playlist_repository import PlaylistRepository
-from app.services.bpm_lookup import BpmLookupService
 from app.services.genre_lookup import GenreLookupService
 
 litellm.suppress_debug_info = True
@@ -139,16 +141,12 @@ class ClassificationResult:
     playlist_id: Optional[int]
     confidence: float
     explanation: Explanation
-    bpm: Optional[float]
-    bpm_source: Optional[str]
     genre: Optional[str]
 
     def as_explanation_dict(self) -> dict:
         return {
             "signal": self.explanation.signal,
             "detail": self.explanation.detail,
-            "bpm": self.bpm,
-            "bpm_source": self.bpm_source,
             "genre": self.genre,
         }
 
@@ -157,13 +155,9 @@ class _DescriptionMatch(BaseModel):
     matched_playlists: list[str] = []
 
 
-def _rule_matches(rule: dict, genre: Optional[str], bpm: Optional[float]) -> bool:
+def _rule_matches(rule: dict, genre: Optional[str]) -> bool:
     """A playlist's explicit rule is a hard gate (KTD10): every present condition must hold."""
     if "genre" in rule and (genre is None or rule["genre"].lower() != genre.lower()):
-        return False
-    if "bpm_min" in rule and (bpm is None or bpm < rule["bpm_min"]):
-        return False
-    if "bpm_max" in rule and (bpm is None or bpm > rule["bpm_max"]):
         return False
     return True
 
@@ -184,13 +178,13 @@ class ClassificationService:
     def __init__(
         self,
         genre_lookup: GenreLookupService,
-        bpm_lookup: BpmLookupService,
         openrouter_api_key: Optional[str] = None,
         correction_log_repo: Optional[CorrectionLogRepository] = None,
     ):
         self.genre_lookup = genre_lookup
-        self.bpm_lookup = bpm_lookup
-        self.openrouter_api_key = openrouter_api_key or bpm_lookup.openrouter_api_key
+        self.openrouter_api_key = (
+            openrouter_api_key if openrouter_api_key is not None else get_settings().openrouter_api_key
+        )
         # U7/R15: additive and optional. When None (the default — unchanged for
         # every existing two-positional-arg caller), classify_track's behavior
         # is byte-for-byte identical to before this parameter existed.
@@ -208,7 +202,6 @@ class ClassificationService:
         playlist_id=None, so the caller always has something to queue."""
         artist = track_artist(track)
         genre = self.genre_lookup.genre_for(artist)
-        bpm_result = self.bpm_lookup.lookup_bpm(artist, track.get("title", ""))
         results: list[ClassificationResult] = []
 
         def _result(playlist_id: Optional[int], confidence: float, explanation: Explanation) -> ClassificationResult:
@@ -216,8 +209,6 @@ class ClassificationService:
                 playlist_id=playlist_id,
                 confidence=confidence,
                 explanation=explanation,
-                bpm=bpm_result.bpm,
-                bpm_source=bpm_result.source,
                 genre=genre,
             )
 
@@ -226,7 +217,7 @@ class ClassificationService:
         # ruled playlist whose rule matches is its own independent result.
         ruled_playlists = [p for p in candidate_playlists if p.rule]
         for playlist in ruled_playlists:
-            if _rule_matches(playlist.rule, genre, bpm_result.bpm):
+            if _rule_matches(playlist.rule, genre):
                 results.append(
                     _result(
                         playlist.id,
@@ -351,8 +342,8 @@ class ClassificationService:
             # description-match stage. Caught broadly and deliberately: this is
             # the per-song fault-isolation boundary, so it falls through to "no
             # match" rather than raising and blocking the caller's next song.
-            # Own health-store key (distinct from BPM-estimate/clustering,
-            # KTD17) so one LLM use case's failure can't mask another's.
+            # Own health-store key (distinct from clustering, KTD17) so one LLM
+            # use case's failure can't mask another's.
             dependency_health_store.set_status(
                 "llm_description_match", DependencyStatus.DEGRADED, f"description match failed: {exc}"
             )
@@ -392,6 +383,9 @@ class ClassificationService:
                 },
                 temperature=0.0,
                 max_tokens=200,
+                # No timeout means a single stalled request hangs this synchronous
+                # call forever.
+                timeout=30,
             )
 
         resp = call_with_retry(
@@ -436,6 +430,9 @@ class ClassificationService:
                 ],
                 temperature=0.2,
                 max_tokens=100,
+                # No timeout means a single stalled request hangs this synchronous
+                # call forever.
+                timeout=30,
             )
 
         try:
@@ -455,3 +452,76 @@ class ClassificationService:
             )
             return None
         return text or None
+
+
+# Bounded so a large batch doesn't fire unbounded concurrent requests at the
+# LLM provider -- same bound the app previously used for parallel BPM
+# lookups (removed) since both are "one independent network call per song."
+CLASSIFY_MAX_WORKERS = 10
+
+
+def classify_tracks_concurrently(
+    tracks: list[Track],
+    candidate_playlists: list[CandidatePlaylist],
+    classification_service: ClassificationService,
+    user_id: Optional[int],
+    engine=None,
+) -> list[Optional[list[ClassificationResult]]]:
+    """Classifies every track in `tracks`, returning one classify_track
+    result (or None on a per-song failure, KTD18) per track, aligned by
+    index with `tracks`.
+
+    classify_track's dominant cost is a synchronous LLM network call
+    (_match_description_with_llm) run one song at a time -- for a
+    BACKFILL_BATCH_SIZE-sized batch that serializes a lot of network
+    latency. When `engine` is given, this fans the batch out across a
+    bounded thread pool instead. Each worker opens its own DB session and
+    builds its own ClassificationService from `classification_service`'s own
+    openrouter_api_key/correction_log_repo rather than sharing the caller's
+    instance across threads -- a SQLAlchemy Session is not thread-safe, even
+    for concurrent reads, and classify_track does touch the DB (genre
+    lookup's cache, and a cache miss there writes to it too; correction-log
+    reads).
+
+    Because of that reconstruction, only pass `engine` when
+    `classification_service` is guaranteed to be a real ClassificationService
+    -- a test's mocked one (this codebase's standard way to keep a test from
+    making real LLM calls) doesn't have real openrouter_api_key/
+    correction_log_repo attributes and would either raise or, worse, get
+    silently bypassed by fresh real instances that ignore the mock's
+    configured behavior. `engine=None` (every existing call site, since
+    callers only pass their own engine through here once they've confirmed
+    `classification_service` wasn't caller-supplied -- see
+    run_ingestion_check_to_completion) keeps the original single-threaded
+    loop against the exact `classification_service` object given, unchanged.
+    """
+    if engine is None or len(tracks) <= 1:
+        results: list[Optional[list[ClassificationResult]]] = []
+        for track in tracks:
+            try:
+                results.append(
+                    classification_service.classify_track(track, candidate_playlists, user_id=user_id)
+                )
+            except Exception:
+                results.append(None)
+        return results
+
+    openrouter_api_key = classification_service.openrouter_api_key
+    wants_correction_feedback = classification_service.correction_log_repo is not None
+
+    def _classify_one(track: Track) -> Optional[list[ClassificationResult]]:
+        with Session(engine) as worker_session:
+            worker_service = ClassificationService(
+                GenreLookupService(worker_session),
+                openrouter_api_key=openrouter_api_key,
+                correction_log_repo=(
+                    CorrectionLogRepository(worker_session) if wants_correction_feedback else None
+                ),
+            )
+            try:
+                return worker_service.classify_track(track, candidate_playlists, user_id=user_id)
+            except Exception:
+                return None
+
+    with ThreadPoolExecutor(max_workers=CLASSIFY_MAX_WORKERS) as executor:
+        return list(executor.map(_classify_one, tracks))

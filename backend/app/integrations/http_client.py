@@ -1,9 +1,9 @@
 """Shared timeout/retry/circuit-breaking wrapper (KTD24).
 
 Used by every external integration (YouTube Music, the Data API, the LLM
-provider, Last.fm, GetSongBPM) instead of each rolling its own retry loop —
-KTD18's per-dependency isolation in the classification hot path is one
-application of this wrapper, not a separate implementation.
+provider, Last.fm) instead of each rolling its own retry loop — KTD18's
+per-dependency isolation in the classification hot path is one application
+of this wrapper, not a separate implementation.
 """
 
 import time

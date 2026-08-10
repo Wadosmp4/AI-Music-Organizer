@@ -10,7 +10,6 @@ from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
 from app.repositories.user_repository import UserRepository
-from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
 from app.services.classification import ClassificationResult, ClassificationService, Explanation
 from app.services.genre_lookup import GenreLookupService
 
@@ -39,8 +38,6 @@ def _matching_classification_service(playlist_id: int) -> MagicMock:
             playlist_id=playlist_id,
             confidence=0.8,
             explanation=Explanation("artist_similarity", "matched"),
-            bpm=None,
-            bpm_source=None,
             genre=None,
         )
     ]
@@ -54,8 +51,6 @@ def _no_match_classification_service() -> MagicMock:
             playlist_id=None,
             confidence=0.0,
             explanation=Explanation("none", "no match"),
-            bpm=None,
-            bpm_source=None,
             genre=None,
         )
     ]
@@ -119,6 +114,57 @@ def test_new_liked_song_produces_exactly_one_queue_item(session):
     assert items[0].playlist_id == playlist.id
 
 
+def test_concurrent_library_item_insert_is_recovered_not_crashed(session):
+    """Mirrors the same real bug fixed in reorganize_matching.py: a
+    double-clicked retry (or any two overlapping ingestion checks) can both
+    decide a video_id is new and both try to create its LibraryItem, hitting
+    video_id's global UNIQUE constraint on the second insert. Simulated by
+    making create() insert the row for real (as the "other" caller would
+    have) and then raise the same IntegrityError SQLite raises on a genuine
+    concurrent insert."""
+    from unittest.mock import patch
+
+    from sqlalchemy.exc import IntegrityError
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = [
+        {"videoId": "racy1", "title": "Song A", "artists": [{"name": "Artist"}]}
+    ]
+
+    real_create = LibraryRepository.create
+
+    def _racy_create(self, item):
+        real_create(self, item)
+        raise IntegrityError(
+            "INSERT INTO library_item ...", {}, Exception("UNIQUE constraint failed: library_item.video_id")
+        )
+
+    with patch.object(LibraryRepository, "create", _racy_create):
+        result = run_ingestion_check(
+            music_client=music_client,
+            classification_service=_matching_classification_service(playlist.id),
+            library_repository=library_repo,
+            playlist_repository=playlist_repo,
+            review_queue_repository=queue_repo,
+            user_repository=user_repo,
+            user_id=user.id,
+        )
+
+    assert result.new_songs_found == 1
+    assert result.queue_items_created == 1
+    library_item = library_repo.get_by_video_id("racy1")
+    assert library_item is not None
+    items = queue_repo.list_for_user(user.id)
+    assert len(items) == 1
+    assert items[0].library_item_id == library_item.id
+
+
 def test_a_song_matching_two_playlists_is_queued_in_both(session):
     """The user's own framing: a song isn't limited to one playlist. Two
     playlists both clear the artist-similarity bar for the same artist --
@@ -140,16 +186,12 @@ def test_a_song_matching_two_playlists_is_queued_in_both(session):
             playlist_id=rock.id,
             confidence=0.8,
             explanation=Explanation("artist_similarity", "matched Rock"),
-            bpm=None,
-            bpm_source=None,
             genre=None,
         ),
         ClassificationResult(
             playlist_id=favorites.id,
             confidence=0.6,
             explanation=Explanation("description_match", "matched Favorites"),
-            bpm=None,
-            bpm_source=None,
             genre=None,
         ),
     ]
@@ -209,10 +251,10 @@ def test_adopted_playlists_real_youtube_content_feeds_artist_similarity_matching
 
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = None
-    classification_service = ClassificationService(genre_lookup, bpm_lookup)
+    # Explicit "" (not the default None): None now falls through to
+    # get_settings().openrouter_api_key, which could pick up a real key from
+    # the process environment and make a real, billed API call here.
+    classification_service = ClassificationService(genre_lookup, openrouter_api_key="")
 
     result = run_ingestion_check(
         music_client=music_client,
@@ -330,10 +372,11 @@ def test_backfill_processes_backlog_in_bounded_batches_and_resumes(session):
     playlist = playlist_repo.create(
         Playlist(user_id=user.id, name="Rock", description=None, rule=None)
     )
-    # More songs than one batch can hold.
+    # More songs than one batch can hold: two full batches plus a partial third.
+    total_songs = 2 * BACKFILL_BATCH_SIZE + BACKFILL_BATCH_SIZE // 2
     songs = [
         {"videoId": f"v{i}", "title": f"Song {i}", "artists": [{"name": "Artist"}]}
-        for i in range(120)
+        for i in range(total_songs)
     ]
     music_client = MagicMock()
     music_client.get_liked_songs.return_value = songs
@@ -349,7 +392,7 @@ def test_backfill_processes_backlog_in_bounded_batches_and_resumes(session):
         user_id=user.id,
     )
     assert first.mode == "backfill"
-    assert first.new_songs_found == 50  # BACKFILL_BATCH_SIZE
+    assert first.new_songs_found == BACKFILL_BATCH_SIZE
     assert first.backfill_complete is False
     fresh_user = user_repo.get(user.id)
     assert fresh_user.backfill_completed_at is None
@@ -363,7 +406,7 @@ def test_backfill_processes_backlog_in_bounded_batches_and_resumes(session):
         user_repository=user_repo,
         user_id=user.id,
     )
-    assert second.new_songs_found == 50
+    assert second.new_songs_found == BACKFILL_BATCH_SIZE
     assert second.backfill_complete is False
 
     third = run_ingestion_check(
@@ -375,13 +418,13 @@ def test_backfill_processes_backlog_in_bounded_batches_and_resumes(session):
         user_repository=user_repo,
         user_id=user.id,
     )
-    assert third.new_songs_found == 20  # remaining 120 - 50 - 50
+    assert third.new_songs_found == BACKFILL_BATCH_SIZE // 2  # remaining partial batch
     assert third.backfill_complete is True
     fresh_user = user_repo.get(user.id)
     assert fresh_user.backfill_completed_at is not None
 
-    assert len(library_repo.list_for_user(user.id)) == 120
-    assert len(queue_repo.list_for_user(user.id)) == 120
+    assert len(library_repo.list_for_user(user.id)) == total_songs
+    assert len(queue_repo.list_for_user(user.id)) == total_songs
 
     # Steady state now: a brand-new song shows up, still processed normally.
     songs.append({"videoId": "v-new", "title": "New Song", "artists": [{"name": "Artist"}]})
@@ -439,9 +482,10 @@ def test_steady_state_check_is_bounded_the_same_as_backfill(session):
     playlist = playlist_repo.create(
         Playlist(user_id=user.id, name="Rock", description=None, rule=None)
     )
+    remainder = BACKFILL_BATCH_SIZE // 2
     songs = [
         {"videoId": f"burst-{i}", "title": f"Song {i}", "artists": [{"name": "Artist"}]}
-        for i in range(BACKFILL_BATCH_SIZE + 30)
+        for i in range(BACKFILL_BATCH_SIZE + remainder)
     ]
     music_client = MagicMock()
     music_client.get_liked_songs.return_value = songs
@@ -458,7 +502,7 @@ def test_steady_state_check_is_bounded_the_same_as_backfill(session):
     )
 
     assert result.mode == "steady_state"
-    assert result.new_songs_found == BACKFILL_BATCH_SIZE  # capped, not all 80
+    assert result.new_songs_found == BACKFILL_BATCH_SIZE  # capped, not all of them
     assert len(library_repo.list_for_user(user.id)) == BACKFILL_BATCH_SIZE
 
     # The remaining songs are picked up on the next call, same as backfill.
@@ -471,7 +515,7 @@ def test_steady_state_check_is_bounded_the_same_as_backfill(session):
         user_repository=user_repo,
         user_id=user.id,
     )
-    assert second.new_songs_found == 30
+    assert second.new_songs_found == remainder
 
 
 def test_classification_failure_leaves_song_out_of_membership_index_so_the_next_check_retries_it(
@@ -518,8 +562,6 @@ def test_classification_failure_leaves_song_out_of_membership_index_so_the_next_
             playlist_id=playlist.id,
             confidence=0.8,
             explanation=Explanation("artist_similarity", "matched"),
-            bpm=None,
-            bpm_source=None,
             genre=None,
         )
     ]
@@ -694,6 +736,161 @@ def test_reset_backlog_leaves_approved_and_moved_songs_untouched(session):
     assert [item.id for item in remaining_items] == [approved_item.id]
     remaining_queue_items = queue_repo.list_for_user(user.id)
     assert [item.id for item in remaining_queue_items] == [approved_queue_item.id]
+
+
+def test_matching_playlist_is_not_reoffered_a_second_pending_candidate(session):
+    """The (library_item, playlist) pair dedup check (mirrors
+    reorganize_matching.py's active_pairs_for_user usage): if a song already
+    has an active/committed candidate row for a playlist -- e.g. from an
+    earlier check, or from Reorganize matching the same song/playlist pair
+    -- a later ingestion check must not queue a second one for that exact
+    pair. A different, second matched playlist still gets its own row."""
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    rock = playlist_repo.create(Playlist(user_id=user.id, name="Rock", description=None, rule=None))
+    chill = playlist_repo.create(Playlist(user_id=user.id, name="Chill", description=None, rule=None))
+
+    library_item = library_repo.create(
+        LibraryItem(user_id=user.id, video_id="v1", title="Song A", artist="Artist")
+    )
+    # Already an active candidate for (v1, Rock) -- e.g. queued by an earlier
+    # pass. (v1, Chill) has no candidate yet.
+    queue_repo.create(
+        ReviewQueueItem(user_id=user.id, library_item_id=library_item.id, playlist_id=rock.id, status="pending")
+    )
+
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = [
+        {"videoId": "v2", "title": "Song B", "artists": [{"name": "Artist"}]}
+    ]
+    classification_service = MagicMock(spec=ClassificationService)
+    classification_service.classify_track.return_value = [
+        ClassificationResult(
+            playlist_id=rock.id,
+            confidence=0.8,
+            explanation=Explanation("artist_similarity", "matched Rock"),
+            genre=None,
+        ),
+        ClassificationResult(
+            playlist_id=chill.id,
+            confidence=0.6,
+            explanation=Explanation("description_match", "matched Chill"),
+            genre=None,
+        ),
+    ]
+
+    # v2 is a brand-new song classified against both Rock and Chill -- this
+    # only exercises the dedup path for v1's pre-existing Rock candidate via
+    # the shared active_pairs set built once up front, since real dedup for
+    # a genuinely new song's own two results isn't possible (neither pair
+    # exists yet). Assert v1 still has exactly one Rock row (not doubled)
+    # after this run, and v2 got both its own new rows.
+    result = run_ingestion_check(
+        music_client=music_client,
+        classification_service=classification_service,
+        library_repository=library_repo,
+        playlist_repository=playlist_repo,
+        review_queue_repository=queue_repo,
+        user_repository=user_repo,
+        user_id=user.id,
+    )
+
+    assert result.queue_items_created == 2  # only v2's two new rows
+    v1_items = [i for i in queue_repo.list_for_user(user.id) if i.library_item_id == library_item.id]
+    assert len(v1_items) == 1  # not duplicated
+
+
+def test_trigger_ingestion_check_marks_in_progress(session):
+    from app.jobs.ingestion import trigger_ingestion_check
+
+    user = _onboarded_user(session)
+    _, _, _, user_repo = _repos(session)
+    assert user.ingestion_status == "idle"
+
+    updated = trigger_ingestion_check(user_repo, user.id)
+
+    assert updated.ingestion_status == "in_progress"
+    assert user_repo.get(user.id).ingestion_status == "in_progress"
+
+
+def test_trigger_ingestion_check_rejects_when_already_in_progress(session):
+    from app.jobs.ingestion import IngestionAlreadyInProgressError, trigger_ingestion_check
+
+    user = _onboarded_user(session)
+    _, _, _, user_repo = _repos(session)
+    user_repo.set_ingestion_progress(user.id, status="in_progress")
+
+    try:
+        trigger_ingestion_check(user_repo, user.id)
+        assert False, "expected IngestionAlreadyInProgressError"
+    except IngestionAlreadyInProgressError:
+        pass
+
+
+def test_run_ingestion_check_to_completion_loops_backfill_to_done(session):
+    """The background-task version (mirrors run_reorganize_matching): a
+    backlog bigger than one batch is processed to completion in a single
+    call, instead of depending on the frontend to click "Load next 50
+    songs" repeatedly."""
+    from app.jobs.ingestion import run_ingestion_check_to_completion
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+    songs = [
+        {"videoId": f"v{i}", "title": f"Song {i}", "artists": [{"name": "Artist"}]}
+        for i in range(BACKFILL_BATCH_SIZE + 25)
+    ]
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = songs
+    classification_service = _matching_classification_service(playlist.id)
+
+    run_ingestion_check_to_completion(
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    fresh_user = user_repo.get(user.id)
+    assert fresh_user.ingestion_status == "done"
+    assert fresh_user.ingestion_processed_count == len(songs)
+    assert fresh_user.ingestion_total_count == len(songs)
+    assert fresh_user.backfill_completed_at is not None
+    assert len(library_repo.list_for_user(user.id)) == len(songs)
+    assert len(queue_repo.list_for_user(user.id)) == len(songs)
+
+
+def test_run_ingestion_check_to_completion_stops_once_steady_state_burst_is_drained(session):
+    from app.jobs.ingestion import run_ingestion_check_to_completion
+
+    user = _onboarded_user(session)
+    library_repo, playlist_repo, queue_repo, user_repo = _repos(session)
+    user_repo.mark_backfill_completed(user.id)  # already in steady_state
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None)
+    )
+    songs = [
+        {"videoId": f"burst-{i}", "title": f"Song {i}", "artists": [{"name": "Artist"}]}
+        for i in range(BACKFILL_BATCH_SIZE + 10)
+    ]
+    music_client = MagicMock()
+    music_client.get_liked_songs.return_value = songs
+    classification_service = _matching_classification_service(playlist.id)
+
+    run_ingestion_check_to_completion(
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    fresh_user = user_repo.get(user.id)
+    assert fresh_user.ingestion_status == "done"
+    assert fresh_user.ingestion_processed_count == len(songs)
+    assert len(library_repo.list_for_user(user.id)) == len(songs)
 
 
 def test_reset_backlog_leaves_approved_pending_apply_songs_untouched(session):

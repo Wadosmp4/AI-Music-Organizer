@@ -1,9 +1,9 @@
 """Per-dependency health surfacing for the classification hot path (KTD18).
 
-A rate-limited or degraded response from the LLM, Last.fm, or GetSongBPM
-must be distinguishable from a genuine "not found" and surfaced through
-health status (extending KTD17's never-blend-signals principle to these
-three dependencies) rather than silently treated as a clean miss.
+A rate-limited or degraded response from the LLM or Last.fm must be
+distinguishable from a genuine "not found" and surfaced through health
+status (extending KTD17's never-blend-signals principle to these
+dependencies) rather than silently treated as a clean miss.
 """
 
 from enum import Enum

@@ -103,6 +103,47 @@ def test_applying_creates_missing_playlists_and_leaves_existing_ones_untouched(s
     assert refreshed_session.apply_last_result["failed"] == 0
 
 
+def test_song_already_in_the_target_playlist_on_youtube_is_not_added_again(session):
+    """A song can already be in the target YouTube playlist -- added outside
+    this app, or by an earlier apply run that succeeded on YouTube but
+    crashed before recording it -- writing it again would create a real
+    duplicate track. get_playlist_tracks is checked once per playlist before
+    any writes to that playlist happen."""
+    user = _make_user(session)
+    library_repo, playlist_repo, queue_repo, reorganize_repo = _repos(session)
+
+    playlist = playlist_repo.create(
+        Playlist(user_id=user.id, name="Rock", description=None, rule=None, youtube_playlist_id="yt-rock")
+    )
+    reorganize_session = reorganize_repo.create(
+        ReorganizeSession(
+            user_id=user.id, video_id_snapshot=["v1"], clustering_status="done", apply_status="in_progress"
+        )
+    )
+    item = library_repo.create(LibraryItem(user_id=user.id, video_id="v1", title="A", artist="Artist"))
+    queue_repo.create(
+        ReviewQueueItem(
+            user_id=user.id,
+            library_item_id=item.id,
+            playlist_id=playlist.id,
+            status="approved_pending_apply",
+            reorganize_session_id=reorganize_session.id,
+        )
+    )
+
+    music_client = _music_client(["v1"])
+    music_client.get_playlist_tracks.return_value = [{"videoId": "v1", "title": "A", "artists": []}]
+
+    run_finish_and_apply(reorganize_session.id, user.id, music_client, engine=session.get_bind())
+
+    music_client.add_playlist_items.assert_not_called()
+    all_items = queue_repo.list_for_user(user.id)
+    assert all(item.status == "approved" for item in all_items)
+    refreshed_session = reorganize_repo.get(reorganize_session.id)
+    assert refreshed_session.apply_last_result["succeeded"] == 1
+    assert refreshed_session.apply_last_result["failed"] == 0
+
+
 def test_one_items_write_failure_does_not_block_the_rest_of_the_batch(session):
     """Covers AE3."""
     user = _make_user(session)

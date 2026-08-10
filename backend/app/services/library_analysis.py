@@ -1,17 +1,22 @@
 """Onboarding library analysis and new-playlist selection (U9, F5, R7).
 
-Distinct from U3's per-song classification hot path: this batches *every*
-library item pulled in so far through the LLM at once (ported from
-organize_music.py's suggest_playlists) to find clusters of thematically
-related songs worth proposing as brand-new playlists — name, theme, and an
-estimated song count only. Deliberately not limited to still-unplaced songs:
-a song can already fit an existing playlist and still belong in a newly
-proposed one too (multi-label matching means accepting a new proposal never
-removes it from where it already landed). No songs are attached and no
-review_queue items are created here (R8) — that's U4's backfill, which this
-unit deliberately gates: only after the user's selection completes does
-onboarding_completed_at get set, which U4 checks before it starts classifying
-(F5 step 4).
+Distinct from U3's per-song classification hot path: this batches the user's
+*complete* current liked-songs library, fetched fresh from YouTube (not
+whatever happens to already be ingested locally), through the LLM at once
+(ported from organize_music.py's suggest_playlists) to find clusters of
+thematically related songs worth proposing as brand-new playlists — name,
+theme, and an estimated song count only. Deliberately not limited to
+still-unplaced songs: a song can already fit an existing playlist and still
+belong in a newly proposed one too (multi-label matching means accepting a
+new proposal never removes it from where it already landed). No songs are
+attached and no review_queue items are created here (R8) — that's U4's
+backfill, which this unit deliberately gates: only after the user's
+selection completes does onboarding_completed_at get set, which U4 checks
+before it starts classifying (F5 step 4). This two-phase split is
+deliberate: phase one (this unit) analyzes everything to propose playlists,
+phase two (U4's backfill) then processes every song into them — each with
+its own progress signal (proposals_processed_count/total_count here,
+ingestion_processed_count/total_count there).
 """
 
 from dataclasses import dataclass
@@ -21,8 +26,10 @@ from typing import Optional
 import litellm
 from litellm import completion
 from pydantic import BaseModel
+from sklearn.cluster import HDBSCAN
 from sqlmodel import Session
 
+from app.core.config import get_settings
 from app.core.db import get_engine
 from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
@@ -31,19 +38,29 @@ from app.integrations.youtube_data_api_client import track_artist
 from app.models.base import utcnow
 from app.models.playlist import Playlist
 from app.models.reorganize_session import ReorganizeSession
+from app.models.user import User
 from app.repositories.library_repository import LibraryRepository
+from app.repositories.onboarding_proposal_repository import OnboardingProposalRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
 from app.repositories.user_repository import UserRepository
+from app.repositories.vector_repository import QdrantVectorRepository, get_vector_repository
+from app.repositories.vector_repository import content_hash as _track_content_hash
+from app.services.embeddings import embed_texts
 from app.services.genre_lookup import GenreLookupService
 from app.services.reorganize_apply import ApplyAlreadyInProgressError, ReorganizeSessionNotFoundError
 
 litellm.suppress_debug_info = True
 
 CLUSTERING_MODEL = "openrouter/google/gemini-2.5-flash"
-BATCH_SIZE = 150  # a single call over thousands of tracks overflows the model's output budget
 MIN_CLUSTER_SIZE = 4  # ported from organize_music.py — minimum songs to justify a new playlist
+
+# How often run_reorganize_clustering persists enriched_count while working
+# through the enrichment phase -- frequent enough for a smooth-looking
+# progress bar, infrequent enough not to add up to a lot of individual DB
+# commits for a large library.
+ENRICHMENT_PROGRESS_CHECKPOINT = 25
 
 # KTD9: if clustering_status is "in_progress" but no PlaylistProposal row has
 # been persisted for a reorganize session in longer than this, the poll
@@ -51,39 +68,31 @@ MIN_CLUSTER_SIZE = 4  # ported from organize_music.py — minimum songs to justi
 # background task forever.
 STALLED_THRESHOLD_SECONDS = 120
 
-SYSTEM_PROMPT = """
-You are organizing a YouTube Music library into playlists.
+# Naming-only prompt (KTD: replaces the old grouping-and-naming prompt) --
+# cluster membership is now decided geometrically by HDBSCAN over track
+# embeddings (see _hdbscan_clusters), so the LLM's only job left is to
+# describe a group it didn't have to invent. This also means there's no
+# index-selection game to referee: every song handed to this call already
+# belongs in the resulting playlist.
+NAMING_SYSTEM_PROMPT = """
+You are naming a YouTube Music playlist.
 
-You will get a numbered list of songs (artist, title, and a rough genre tag when
-known). Group them into a small number of thematically coherent playlists using
-your own knowledge of these artists/songs — genre, mood, era, or language. The
-genre tag is only a hint; it may be missing or wrong.
+You will get a numbered list of songs (artist, title, and a rough genre tag
+when known) that have already been grouped together because their titles,
+artists, and genres are similar. Using your own knowledge of these
+artists/songs, give this group:
+- A short, human-friendly playlist name (e.g. "90s R&B", "Ukrainian Rock", "Chill Electronic").
+- A one-sentence theme description a listener could recognize the vibe from.
 
-Rules:
-- Cluster by genre, mood, or theme, never by artist identity. A good playlist
-  spans multiple different artists that share a real musical throughline —
-  it is not just "everything by this one artist."
-- Do not propose a playlist whose songs are all by the same single artist
-  unless every one of those songs plainly has no other thematic home. Prefer
-  merging a small same-artist group into a broader genre/mood cluster with
-  other artists over proposing it as its own playlist.
-- Only propose a playlist for a group of at least 4 clearly related songs.
-- Give each playlist a short, human-friendly name (e.g. "90s R&B", "Ukrainian Rock", "Chill Electronic").
-- Give each playlist a one-sentence theme description a listener could recognize the vibe from.
-- Every song index must appear in at most one playlist.
-- Leave out songs that don't fit well anywhere — do not force weak groupings.
-- Only use indices that were given to you; never invent songs.
+Base the name and theme on what these specific songs actually have in
+common — genre, mood, era, or language. Do not just describe them as
+"various" or "mixed" — find the real throughline.
 """
 
 
-class _PlaylistSuggestion(BaseModel):
+class _ClusterName(BaseModel):
     name: str
     theme: str
-    indices: list[int]
-
-
-class _PlaylistSuggestions(BaseModel):
-    playlists: list[_PlaylistSuggestion]
 
 
 @dataclass
@@ -104,6 +113,28 @@ class ReorganizeStatus:
 
     session_id: int
     clustering_status: str
+    proposals: list
+    # Live enrichment progress -- total_count is the session's full snapshot
+    # size (known immediately), enriched_count trails it as the background
+    # task works through the library. Both 0 before a session ever starts.
+    enriched_count: int
+    total_count: int
+    # Live matching progress (U4 follow-up) -- matched_count trails
+    # total_count the same way, once matching has been triggered.
+    matching_status: str
+    matched_count: int
+
+
+@dataclass
+class OnboardingProposalsStatus:
+    """Poll-endpoint response shape for onboarding's initial AI-suggested
+    playlists -- same idea as ReorganizeStatus, but user-scoped instead of
+    session-scoped (this runs once per user, before any reorganize session
+    exists)."""
+
+    proposals_status: str
+    proposals_processed_count: int
+    proposals_total_count: int
     proposals: list
 
 
@@ -132,15 +163,93 @@ def _format_existing_playlists_context(playlists: list[Playlist]) -> str:
     )
 
 
-def _cluster_batch(
-    circuit_breaker: CircuitBreaker, batch: list[dict], existing_context: str = ""
-) -> list[dict]:
-    """Module-level (not an instance method) so the background reorganize
-    clustering runner (U2) can call it without constructing a full
-    LibraryAnalysisService -- it never needs `music_client` or any
-    repository, only an LLM call and a circuit breaker to guard it."""
-    schema = _PlaylistSuggestions.model_json_schema()
-    user_content = _format_tracks(batch)
+def _track_text(track: dict) -> str:
+    genre = f" [{track['genre']}]" if track.get("genre") else ""
+    return f"{track.get('artist', '')} - {track.get('title', '')}{genre}"
+
+
+def _get_or_create_embeddings(
+    vector_repo: QdrantVectorRepository, user_id: int, tracks: list[dict]
+) -> list[list[float]]:
+    """Returns one embedding vector per track, aligned 1:1 with `tracks` by
+    index. Reuses whatever's already stored in Qdrant for a track whose
+    title/artist/genre haven't changed since the last clustering run (same
+    reuse idea as genre_lookup.py's DB-backed cache) and only calls the
+    local embedding model for what's new or changed -- a repeat run on a
+    mostly-unchanged library only pays to embed the delta.
+    """
+    vector_repo.ensure_collection()
+    existing = vector_repo.get_existing(user_id, [t["videoId"] for t in tracks])
+
+    vectors: list[Optional[list[float]]] = [None] * len(tracks)
+    stale_indices = []
+    for i, track in enumerate(tracks):
+        cached = existing.get(track["videoId"])
+        expected_hash = _track_content_hash(
+            track.get("title", ""), track.get("artist", ""), track.get("genre")
+        )
+        if cached is not None and cached.content_hash == expected_hash:
+            vectors[i] = cached.vector
+        else:
+            stale_indices.append(i)
+
+    if stale_indices:
+        new_vectors = embed_texts([_track_text(tracks[i]) for i in stale_indices])
+        for i, vector in zip(stale_indices, new_vectors):
+            vectors[i] = vector
+        vector_repo.upsert_tracks(user_id, [tracks[i] for i in stale_indices], new_vectors)
+
+    return vectors  # type: ignore[return-value]
+
+
+def _hdbscan_clusters(vectors: list[list[float]]) -> list[list[int]]:
+    """Groups track indices into clusters over the embedding space -- unlike
+    the old per-batch LLM clustering, this sees the *entire* input at once,
+    so a theme that used to span two separate 150-song batches (and so got
+    split or duplicated) now clusters together in one pass. Tracks that
+    don't fit any dense group (HDBSCAN's noise label -1) are left out, same
+    as the old prompt's "leave out songs that don't fit well" instruction --
+    just discovered geometrically instead of by LLM judgment. No `k` to
+    guess: HDBSCAN finds however many natural clusters exist. Embeddings are
+    pre-normalized (embeddings.py) so plain Euclidean distance ranks
+    identically to cosine distance, avoiding a precomputed distance matrix.
+
+    `cluster_selection_method="leaf"`: verified empirically against a real
+    2,794-track library. The default "eom" (excess-of-mass) picks whichever
+    split of the density tree is most stable overall, which -- combined with
+    `allow_single_cluster` -- let the *root* win outright on that library: a
+    single 2,350-song "cluster" swallowing most of the input instead of
+    finding its ~110 real genre/mood groups. "leaf" always extracts the
+    finest-grained real splits instead of preferring a coarser high-level
+    merge, which is what "propose distinct themed playlists" actually wants.
+    Tradeoff: on a very small/homogeneous input (a handful of songs with no
+    other library to contrast against) HDBSCAN may find no cluster at all
+    rather than reporting the whole input as one -- accepted as an inherent
+    small-N limitation of density-based clustering rather than trading back
+    the large-library correctness bug to paper over it.
+    """
+    if len(vectors) < MIN_CLUSTER_SIZE:
+        return []
+    labels = HDBSCAN(
+        min_cluster_size=MIN_CLUSTER_SIZE, metric="euclidean", copy=False, cluster_selection_method="leaf"
+    ).fit_predict(vectors)
+    clusters: dict[int, list[int]] = {}
+    for i, label in enumerate(labels):
+        if label == -1:
+            continue
+        clusters.setdefault(int(label), []).append(i)
+    return list(clusters.values())
+
+
+def _name_cluster(
+    circuit_breaker: CircuitBreaker, tracks: list[dict], existing_context: str = ""
+) -> Optional[dict]:
+    """Names/describes a cluster whose membership is already fixed by
+    _hdbscan_clusters -- module-level (not an instance method) so the
+    background reorganize clustering runner (U2) can call it without
+    constructing a full LibraryAnalysisService."""
+    schema = _ClusterName.model_json_schema()
+    user_content = _format_tracks(tracks)
     if existing_context:
         user_content = f"{existing_context}\n\n{user_content}"
 
@@ -148,15 +257,20 @@ def _cluster_batch(
         return completion(
             model=CLUSTERING_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": NAMING_SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
             ],
             response_format={
                 "type": "json_schema",
-                "json_schema": {"name": "playlist_suggestions", "schema": schema, "strict": True},
+                "json_schema": {"name": "cluster_name", "schema": schema, "strict": True},
             },
             temperature=0.0,
-            max_tokens=8000,
+            max_tokens=500,
+            # No timeout means a single stalled request hangs this call
+            # forever -- and since this runs once per cluster in a
+            # sequential loop, one hang blocks every cluster still waiting
+            # to be named.
+            timeout=30,
         )
 
     try:
@@ -168,50 +282,73 @@ def _cluster_batch(
             circuit_breaker=circuit_breaker,
         )
         raw = resp.choices[0].message.content or ""
-        parsed = _PlaylistSuggestions.model_validate_json(raw.strip())
+        parsed = _ClusterName.model_validate_json(raw.strip())
     except Exception as exc:
         # Caught broadly and deliberately, matching the sibling LLM call
-        # sites in bpm_lookup.py/classification.py (KTD18): an empty
-        # `choices` list (e.g. a safety-filtered response) raises IndexError
-        # on `resp.choices[0]`, which a narrow except tuple wouldn't cover.
-        # A batch-level clustering failure just leaves those songs
-        # unclustered for this pass — never blocks the rest of the run. Own
-        # health-store key (distinct from BPM-estimate/description-match,
-        # KTD17) so one LLM use case's failure can't mask another's.
+        # site in classification.py (KTD18): an empty `choices` list (e.g. a
+        # safety-filtered response) raises IndexError on `resp.choices[0]`,
+        # which a narrow except tuple wouldn't cover. A single cluster's
+        # naming failure just leaves it unproposed for this pass -- never
+        # blocks the rest of the run. Own health-store key (distinct from
+        # description-match, KTD17) so one LLM use case's failure can't
+        # mask another's.
         dependency_health_store.set_status(
-            "llm_clustering", DependencyStatus.DEGRADED, f"clustering batch failed: {exc}"
+            "llm_clustering", DependencyStatus.DEGRADED, f"clustering (naming) failed: {exc}"
         )
-        return []
+        return None
 
     dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
-    used = set()
-    results = []
-    for suggestion in parsed.playlists:
-        indices = [i for i in suggestion.indices if 0 <= i < len(batch) and i not in used]
-        used.update(indices)
-        if indices:
-            results.append({"name": suggestion.name, "theme": suggestion.theme, "count": len(indices)})
-    return results
+    return {"name": parsed.name, "theme": parsed.theme}
+
+
+def _cluster_and_name(
+    circuit_breaker: CircuitBreaker,
+    vector_repo: QdrantVectorRepository,
+    user_id: int,
+    tracks: list[dict],
+    existing_context: str = "",
+):
+    """Shared clustering primitive (embed -> HDBSCAN -> name each surviving
+    cluster) used by both the Reorganize flow and onboarding's
+    propose_new_playlists -- both cluster the user's complete current
+    liked-songs library and both faced the identical batch-boundary
+    inconsistency under the old per-batch LLM clustering, so they share one
+    implementation rather than maintaining two.
+    Yields one {"name", "theme", "count"} dict per successfully named
+    cluster, in cluster-discovery order, so callers can persist incrementally.
+    """
+    if not tracks:
+        return
+    vectors = _get_or_create_embeddings(vector_repo, user_id, tracks)
+    for indices in _hdbscan_clusters(vectors):
+        cluster_tracks = [tracks[i] for i in indices]
+        named = _name_cluster(circuit_breaker, cluster_tracks, existing_context)
+        if named is not None:
+            yield {"name": named["name"], "theme": named["theme"], "count": len(cluster_tracks)}
 
 
 def run_reorganize_clustering(
-    reorganize_session_id: int, liked_songs: list[dict], engine=None
+    reorganize_session_id: int, liked_songs: list[dict], engine=None, vector_repo=None
 ) -> None:
     """Background task (U2, KTD9): triggered via FastAPI's `BackgroundTasks`
     after the trigger endpoint responds, so it must open its own DB session
     rather than reusing the (already-closed) request session -- the first
     background-job pattern in this codebase (see Risks & Dependencies).
     `engine` defaults to the process-wide engine (`get_engine()`); tests pass
-    their isolated test engine explicitly.
+    their isolated test engine explicitly. `vector_repo` follows the same
+    pattern for the Qdrant client.
 
-    Clusters the session's snapshot in BATCH_SIZE batches, persisting each
-    batch's results as PlaylistProposal rows incrementally (via
-    `merge_proposal`) so the poll endpoint has something durable to read as
-    soon as the first batch completes, instead of blocking on the whole
-    library. A batch-level clustering failure (see `_cluster_batch`) doesn't
-    stop later batches from running.
+    Embeds the session's full snapshot at once and clusters it with HDBSCAN
+    (`_cluster_and_name`) -- unlike the old per-BATCH_SIZE-chunk LLM
+    clustering, the whole library is seen in one pass, so a theme spanning
+    what used to be two separate batches no longer splits or duplicates.
+    Each named cluster is persisted immediately (via `merge_proposal`) so the
+    poll endpoint has something durable to read as soon as it's ready,
+    instead of blocking on the whole library. A single cluster's naming
+    failure (see `_name_cluster`) doesn't stop the rest from being proposed.
     """
     engine = engine or get_engine()
+    vector_repo = vector_repo or get_vector_repository()
     with Session(engine) as db_session:
         reorganize_session_repo = ReorganizeSessionRepository(db_session)
         playlist_repo = PlaylistRepository(db_session)
@@ -223,34 +360,144 @@ def run_reorganize_clustering(
 
         snapshot_ids = set(reorganize_session.video_id_snapshot)
         tracks = [song for song in liked_songs if song.get("videoId") in snapshot_ids]
-        enriched = [
-            {
-                "videoId": track["videoId"],
-                "title": track.get("title", ""),
-                "artist": track_artist(track),
-                "genre": genre_lookup.genre_for(track_artist(track)) if genre_lookup.enabled else None,
-            }
-            for track in tracks
-        ]
+        reorganize_session.enriched_count = 0
+        reorganize_session_repo.update(reorganize_session)
+
+        # Genre lookup, mostly cache hits already -- checkpointed the same
+        # way the old BPM phase was, though it rarely needs more than one
+        # flush now that genre is the only enrichment step.
+        enriched = []
+        for i, track in enumerate(tracks):
+            enriched.append(
+                {
+                    "videoId": track["videoId"],
+                    "title": track.get("title", ""),
+                    "artist": track_artist(track),
+                    "genre": genre_lookup.genre_for(track_artist(track)) if genre_lookup.enabled else None,
+                }
+            )
+            if (i + 1) % ENRICHMENT_PROGRESS_CHECKPOINT == 0 or i + 1 == len(tracks):
+                reorganize_session.enriched_count = i + 1
+                reorganize_session_repo.update(reorganize_session)
+
         existing_context = _format_existing_playlists_context(
             playlist_repo.list_for_user(reorganize_session.user_id)
         )
 
         circuit_breaker = CircuitBreaker()
-        for i in range(0, len(enriched), BATCH_SIZE):
-            batch = enriched[i : i + BATCH_SIZE]
-            for suggestion in _cluster_batch(circuit_breaker, batch, existing_context):
-                reorganize_session_repo.merge_proposal(
-                    reorganize_session_id,
-                    suggestion["name"],
-                    suggestion["theme"],
-                    suggestion["count"],
-                )
+        for suggestion in _cluster_and_name(
+            circuit_breaker, vector_repo, reorganize_session.user_id, enriched, existing_context
+        ):
+            reorganize_session_repo.merge_proposal(
+                reorganize_session_id,
+                suggestion["name"],
+                suggestion["theme"],
+                suggestion["count"],
+            )
 
         reorganize_session = reorganize_session_repo.get(reorganize_session_id)
         if reorganize_session is not None:
             reorganize_session.clustering_status = "done"
             reorganize_session_repo.update(reorganize_session)
+
+
+class OnboardingProposalsAlreadyInProgressError(Exception):
+    """Raised by trigger_propose_new_playlists when this user's own
+    proposals run is already in progress -- mirrors
+    IngestionAlreadyInProgressError / MatchingAlreadyInProgressError so a
+    rapid page remount can't get two concurrent runs past this synchronous
+    pre-flight check."""
+
+
+def trigger_propose_new_playlists(user_repository: UserRepository, user_id: int) -> User:
+    """Synchronous pre-flight for the onboarding-proposals trigger endpoint:
+    claims the concurrent-run guard before the background task starts,
+    mirroring reorganize_matching.trigger_matching / ingestion.trigger_ingestion_check."""
+    user = user_repository.get(user_id)
+    if user.proposals_status == "in_progress":
+        raise OnboardingProposalsAlreadyInProgressError(
+            f"onboarding proposals generation for user {user_id} already in progress"
+        )
+    return user_repository.set_proposals_progress(user_id, status="in_progress", processed=0, total=0)
+
+
+def run_propose_new_playlists(
+    user_id: int, liked_songs: list[dict], engine=None, vector_repo=None, openrouter_api_key=None
+) -> None:
+    """Background task (mirrors run_reorganize_clustering's pattern):
+    generates Onboarding's initial AI-suggested new playlists from the
+    user's complete current liked-songs library, fetched fresh by the
+    trigger endpoint the same way Reorganize's does (not scoped to
+    whatever's already in LibraryItem) -- a brand-new user has nothing in
+    LibraryItem yet (ingestion is gated on onboarding completing, see this
+    module's docstring), so a DB-scoped read here would have proposed
+    nothing at all for exactly the users onboarding exists for. Same
+    progress checkpointing as Reorganize's clustering, persisting proposals
+    incrementally via OnboardingProposalRepository.merge_proposal so the
+    poll endpoint has something durable to read as soon as it's ready,
+    instead of blocking on the whole library like the old synchronous call
+    did.
+
+    `engine`/`vector_repo` follow the same injectable-for-tests pattern as
+    run_reorganize_clustering. `openrouter_api_key` similarly -- leaving it
+    unset (None) reads the real key from Settings; tests pass an explicit
+    value (including "") to control the no-key-configured branch
+    deterministically.
+    """
+    engine = engine or get_engine()
+    vector_repo = vector_repo or get_vector_repository()
+    if openrouter_api_key is None:
+        openrouter_api_key = get_settings().openrouter_api_key
+    with Session(engine) as db_session:
+        user_repository = UserRepository(db_session)
+        playlist_repository = PlaylistRepository(db_session)
+        proposal_repository = OnboardingProposalRepository(db_session)
+        genre_lookup = GenreLookupService(db_session)
+
+        # Fresh run: a re-trigger (e.g. the library changed since last time)
+        # shouldn't leave stale suggestions from the previous snapshot mixed
+        # in with new ones.
+        proposal_repository.clear_for_user(user_id)
+        user_repository.set_proposals_progress(user_id, processed=0, total=0)
+
+        if not openrouter_api_key:
+            user_repository.set_proposals_progress(user_id, status="done")
+            return
+
+        tracks = [song for song in liked_songs if song.get("videoId")]
+        if not tracks:
+            user_repository.set_proposals_progress(user_id, status="done")
+            return
+
+        # Genre lookup, mostly cache hits already -- checkpointed the same
+        # way the old BPM phase was, though it rarely needs more than one
+        # flush now that genre is the only enrichment step.
+        enriched = []
+        for i, track in enumerate(tracks):
+            enriched.append(
+                {
+                    "videoId": track["videoId"],
+                    "title": track.get("title", ""),
+                    "artist": track_artist(track),
+                    "genre": genre_lookup.genre_for(track_artist(track)) if genre_lookup.enabled else None,
+                }
+            )
+            if (i + 1) % ENRICHMENT_PROGRESS_CHECKPOINT == 0 or i + 1 == len(tracks):
+                user_repository.set_proposals_progress(user_id, processed=i + 1, total=len(tracks))
+
+        existing_context = _format_existing_playlists_context(
+            playlist_repository.list_for_user(user_id)
+        )
+
+        circuit_breaker = CircuitBreaker()
+        for suggestion in _cluster_and_name(
+            circuit_breaker, vector_repo, user_id, enriched, existing_context
+        ):
+            proposal_repository.merge_proposal(
+                user_id, suggestion["name"], suggestion["theme"], suggestion["count"]
+            )
+
+        user_repository.set_proposals_progress(user_id, status="done")
 
 
 class PlaylistRemovalRequiresConfirmationError(Exception):
@@ -280,8 +527,8 @@ class LibraryAnalysisService:
         user_repository: UserRepository,
         music_client: MusicServiceClient,
         reorganize_session_repository: Optional[ReorganizeSessionRepository] = None,
-        genre_lookup: Optional[GenreLookupService] = None,
-        openrouter_api_key: Optional[str] = None,
+        onboarding_proposal_repository: Optional[OnboardingProposalRepository] = None,
+        vector_repository: Optional[QdrantVectorRepository] = None,
     ):
         self.library_repository = library_repository
         self.playlist_repository = playlist_repository
@@ -289,9 +536,8 @@ class LibraryAnalysisService:
         self.user_repository = user_repository
         self.music_client = music_client
         self.reorganize_session_repository = reorganize_session_repository
-        self.genre_lookup = genre_lookup
-        self.openrouter_api_key = openrouter_api_key
-        self._circuit_breaker = CircuitBreaker()
+        self.onboarding_proposal_repository = onboarding_proposal_repository
+        self.vector_repository = vector_repository or get_vector_repository()
 
     def list_added_playlists(self, user_id: int) -> list[Playlist]:
         """Playlists this app has already created (a prior onboarding run or
@@ -385,6 +631,10 @@ class LibraryAnalysisService:
             session_id=reorganize_session.id,
             clustering_status=clustering_status,
             proposals=proposals,
+            enriched_count=reorganize_session.enriched_count,
+            total_count=len(reorganize_session.video_id_snapshot),
+            matching_status=reorganize_session.matching_status,
+            matched_count=reorganize_session.matched_count,
         )
 
     def cancel_reorganize(self, reorganize_session_id: int, user_id: int) -> ReorganizeSession:
@@ -416,48 +666,25 @@ class LibraryAnalysisService:
         reorganize_session.clustering_status = "cancelled"
         return self.reorganize_session_repository.update(reorganize_session)
 
-    def propose_new_playlists(self, user_id: int) -> list[PlaylistProposal]:
-        if not self.openrouter_api_key:
-            return []
-
-        library_items = self.library_repository.list_for_user(user_id)
-        library_items = [item for item in library_items if item.removed_at is None]
-        if not library_items:
-            return []
-
-        enriched = [
-            {
-                "videoId": item.video_id,
-                "title": item.title,
-                "artist": item.artist,
-                "genre": self.genre_lookup.genre_for(item.artist) if self.genre_lookup else None,
-            }
-            for item in library_items
+    def get_proposals_status(self, user_id: int) -> "OnboardingProposalsStatus":
+        """Poll-endpoint read for onboarding's initial AI-suggested
+        playlists (mirrors get_reorganize_status): reports whatever's been
+        persisted so far by the background run plus its enrichment
+        progress. Visibility (MIN_CLUSTER_SIZE) is applied here, not at
+        write time, so a cluster that only crosses the threshold once two
+        same-named clusters merge isn't lost in between (KTD8-style)."""
+        user = self.user_repository.get(user_id)
+        proposals = [
+            p
+            for p in self.onboarding_proposal_repository.list_for_user(user_id)
+            if p.song_count >= MIN_CLUSTER_SIZE
         ]
-        existing_context = _format_existing_playlists_context(
-            self.playlist_repository.list_for_user(user_id)
+        return OnboardingProposalsStatus(
+            proposals_status=user.proposals_status,
+            proposals_processed_count=user.proposals_processed_count,
+            proposals_total_count=user.proposals_total_count,
+            proposals=proposals,
         )
-
-        merged: dict[str, dict] = {}
-        for i in range(0, len(enriched), BATCH_SIZE):
-            batch = enriched[i : i + BATCH_SIZE]
-            for suggestion in _cluster_batch(self._circuit_breaker, batch, existing_context):
-                key = suggestion["name"].strip().lower()
-                if key in merged:
-                    merged[key]["count"] += suggestion["count"]
-                else:
-                    merged[key] = suggestion
-
-        return [
-            PlaylistProposal(
-                name=s["name"],
-                theme=s["theme"],
-                song_count=s["count"],
-                confidence=min(0.5 + 0.05 * s["count"], 0.9),
-            )
-            for s in merged.values()
-            if s["count"] >= MIN_CLUSTER_SIZE
-        ]
 
     def complete_onboarding(
         self,
@@ -541,6 +768,7 @@ class LibraryAnalysisService:
                         description=None,
                         rule=None,
                         youtube_playlist_id=adopted["playlist_id"],
+                        source="adopted",
                     )
                 )
             )
@@ -558,6 +786,7 @@ class LibraryAnalysisService:
                         description=description,
                         rule=None,
                         youtube_playlist_id=youtube_playlist_id,
+                        source="proposal",
                     )
                 )
             )
@@ -575,6 +804,7 @@ class LibraryAnalysisService:
                         description=description,
                         rule=None,
                         youtube_playlist_id=youtube_playlist_id,
+                        source="custom",
                     )
                 )
             )

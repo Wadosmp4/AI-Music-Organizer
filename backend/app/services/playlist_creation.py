@@ -60,6 +60,7 @@ class PlaylistCreationService:
                 description=description,
                 rule=None,
                 youtube_playlist_id=youtube_playlist_id,
+                source="custom",
             )
         )
         created_count = self.propose_matches(user_id, playlist)

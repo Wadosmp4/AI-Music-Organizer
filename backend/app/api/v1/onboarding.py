@@ -20,11 +20,19 @@ from app.api.deps import (
     get_reorganize_matching_dependencies,
 )
 from app.integrations.base import MusicServiceClient
+from app.jobs.reorganize_matching import (
+    MatchingAlreadyInProgressError,
+    run_reorganize_matching,
+    trigger_matching,
+)
 from app.models.user import User
 from app.services.library_analysis import (
     LibraryAnalysisService,
+    OnboardingProposalsAlreadyInProgressError,
     PlaylistRemovalRequiresConfirmationError,
+    run_propose_new_playlists,
     run_reorganize_clustering,
+    trigger_propose_new_playlists,
 )
 from app.services.reorganize_apply import (
     ApplyAlreadyInProgressError,
@@ -48,6 +56,10 @@ class AddedPlaylistResponse(BaseModel):
     name: str
     description: Optional[str]
     rule: Optional[dict]
+    # "proposal" | "custom" | "adopted" | None (rows created before this
+    # field existed) -- lets the frontend keep a playlist in the UI section
+    # it originated from, checked, across a remount.
+    source: Optional[str]
 
 
 class YouTubePlaylistResponse(BaseModel):
@@ -55,10 +67,20 @@ class YouTubePlaylistResponse(BaseModel):
     title: str
 
 
-class AnalysisResponse(BaseModel):
-    proposals: list[PlaylistProposalResponse]
+class PlaylistsResponse(BaseModel):
     existing_playlists: list[YouTubePlaylistResponse]
     added_playlists: list[AddedPlaylistResponse]
+
+
+class ProposalsTriggerResponse(BaseModel):
+    proposals_status: str
+
+
+class ProposalsStatusResponse(BaseModel):
+    proposals_status: str
+    proposals_processed_count: int
+    proposals_total_count: int
+    proposals: list[PlaylistProposalResponse]
 
 
 class AcceptedProposal(BaseModel):
@@ -98,28 +120,75 @@ class SelectionResponse(BaseModel):
     created_playlists: list[CreatedPlaylistResponse]
 
 
-@router.get("/analysis", response_model=AnalysisResponse)
-def get_analysis(
+@router.get("/playlists", response_model=PlaylistsResponse)
+def get_playlists(
     user: User = Depends(get_default_user),
     service: LibraryAnalysisService = Depends(get_library_analysis_service),
-) -> AnalysisResponse:
-    proposals = service.propose_new_playlists(user.id)
+) -> PlaylistsResponse:
+    """Fast onboarding data (a DB query and a plain YouTube playlists list) --
+    split out from `/proposals` (AI clustering, can take a long time for a
+    big library) so the frontend can render this immediately instead of
+    both being stuck behind the slow one on a single combined endpoint.
+    """
     added = service.list_added_playlists(user.id)
     existing_on_youtube = service.list_existing_youtube_playlists(user.id)
-    return AnalysisResponse(
-        proposals=[
-            PlaylistProposalResponse(
-                name=p.name, theme=p.theme, song_count=p.song_count, confidence=p.confidence
-            )
-            for p in proposals
-        ],
+    return PlaylistsResponse(
         existing_playlists=[
             YouTubePlaylistResponse(playlist_id=pl["playlistId"], title=pl["title"])
             for pl in existing_on_youtube
         ],
         added_playlists=[
-            AddedPlaylistResponse(id=pl.id, name=pl.name, description=pl.description, rule=pl.rule)
+            AddedPlaylistResponse(
+                id=pl.id, name=pl.name, description=pl.description, rule=pl.rule, source=pl.source
+            )
             for pl in added
+        ],
+    )
+
+
+@router.post("/proposals", response_model=ProposalsTriggerResponse)
+def trigger_proposals(
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_default_user),
+    service: LibraryAnalysisService = Depends(get_library_analysis_service),
+) -> ProposalsTriggerResponse:
+    """AI-suggested new playlists -- embeddings + clustering + LLM naming,
+    slow for a large library (previously up to ~2 minutes of invisible work
+    behind a single "Loading…" spinner). Fetches the complete current
+    liked-songs library fresh (same live call as Reorganize's own trigger)
+    rather than depending on whatever's already been ingested locally --
+    ingestion itself doesn't start until onboarding's selection completes
+    (F5 step 4), so a DB-scoped read here would see nothing for a brand-new
+    user. Runs as a background task (mirrors Reorganize's clustering
+    trigger) so the response returns immediately; poll `GET /proposals` for
+    live progress and results. Split from `/playlists` (see there) so the
+    frontend isn't blocked on this before showing anything at all.
+    """
+    try:
+        updated_user = trigger_propose_new_playlists(service.user_repository, user.id)
+    except OnboardingProposalsAlreadyInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    liked_songs = service.music_client.get_liked_songs()
+    background_tasks.add_task(run_propose_new_playlists, user.id, liked_songs)
+    return ProposalsTriggerResponse(proposals_status=updated_user.proposals_status)
+
+
+@router.get("/proposals", response_model=ProposalsStatusResponse)
+def get_proposals_status(
+    user: User = Depends(get_default_user),
+    service: LibraryAnalysisService = Depends(get_library_analysis_service),
+) -> ProposalsStatusResponse:
+    status = service.get_proposals_status(user.id)
+    return ProposalsStatusResponse(
+        proposals_status=status.proposals_status,
+        proposals_processed_count=status.proposals_processed_count,
+        proposals_total_count=status.proposals_total_count,
+        proposals=[
+            PlaylistProposalResponse(
+                name=p.name, theme=p.theme, song_count=p.song_count, confidence=1.0
+            )
+            for p in status.proposals
         ],
     )
 
@@ -172,6 +241,10 @@ class ReorganizeStatusResponse(BaseModel):
     session_id: int
     clustering_status: str
     proposals: list[ReorganizeProposalResponse]
+    enriched_count: int
+    total_count: int
+    matching_status: str
+    matched_count: int
 
 
 @router.post("/reorganize", response_model=ReorganizeTriggerResponse)
@@ -207,6 +280,44 @@ def get_reorganize_status(
             ReorganizeProposalResponse(name=p.name, theme=p.theme, song_count=p.song_count)
             for p in status.proposals
         ],
+        enriched_count=status.enriched_count,
+        total_count=status.total_count,
+        matching_status=status.matching_status,
+        matched_count=status.matched_count,
+    )
+
+
+class MatchTriggerResponse(BaseModel):
+    session_id: int
+    matching_status: str
+
+
+@router.post("/reorganize/{session_id}/match", response_model=MatchTriggerResponse)
+def match_reorganize(
+    session_id: int,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_default_user),
+    deps: ReorganizeMatchingDependencies = Depends(get_reorganize_matching_dependencies),
+) -> MatchTriggerResponse:
+    """U4/R6/R7: matches the session's full snapshot against candidate
+    playlists as a background task (mirrors clustering's KTD9 pattern) --
+    the response returns immediately with matching_status="in_progress" so
+    the frontend can switch to the Review Queue and poll `/reorganize/{id}`
+    for live progress there instead of babysitting the whole run itself.
+    Rejected, like the apply trigger, while this session's own matching is
+    already running (a rapid double-click on "Finish setup" used to fire
+    two overlapping runs that raced to create the same LibraryItem).
+    """
+    try:
+        reorganize_session = trigger_matching(deps.reorganize_session_repository, session_id, user.id)
+    except ReorganizeSessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except MatchingAlreadyInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(run_reorganize_matching, session_id, user.id)
+    return MatchTriggerResponse(
+        session_id=reorganize_session.id, matching_status=reorganize_session.matching_status
     )
 
 

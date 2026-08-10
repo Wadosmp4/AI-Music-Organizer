@@ -14,7 +14,16 @@ class Playlist(TimestampMixin, table=True):
     name: str
     youtube_playlist_id: Optional[str] = Field(default=None, index=True)
     description: Optional[str] = Field(default=None)
-    # Structured hard-gate rule (KTD10), e.g. {"genre": "rock", "bpm_min": 120, "bpm_max": 160}.
-    # A rule present is a hard gate: the description is not used for candidacy on
+    # Structured hard-gate rule (KTD10), e.g. {"genre": "rock"}. A rule
+    # present is a hard gate: the description is not used for candidacy on
     # this playlist when a rule exists (KTD10).
     rule: Optional[dict[str, Any]] = Field(default=None, sa_column=Column(JSON))
+    # How this playlist entered this app's management: "proposal" (an
+    # accepted AI suggestion), "custom" (the user's own name/description), or
+    # "adopted" (a pre-existing YouTube playlist brought under management).
+    # Lets the Onboarding screen keep each playlist in the UI section it
+    # originated from (checked) across a remount, instead of every accepted
+    # proposal/custom addition collapsing into one generic "added" list once
+    # it becomes a real Playlist row. None for rows created before this field
+    # existed -- the frontend treats that the same as "adopted".
+    source: Optional[str] = Field(default=None, nullable=True)

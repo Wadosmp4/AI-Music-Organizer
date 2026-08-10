@@ -26,7 +26,6 @@ from app.models.review_queue import ReviewQueueItem
 from app.models.user import User
 from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
-from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
 from app.services.classification import CandidatePlaylist, ClassificationService
 from app.services.genre_lookup import GenreLookupService
 
@@ -92,11 +91,12 @@ def engine(tmp_path):
 def _service(genre=None, correction_log_repo=None):
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = genre
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = None
+    # Explicit "" (not the default None): None now falls through to
+    # get_settings().openrouter_api_key, which could pick up a real key from
+    # the process environment and make a real, billed API call during a
+    # test that never mocks completion().
     return ClassificationService(
-        genre_lookup, bpm_lookup, correction_log_repo=correction_log_repo
+        genre_lookup, openrouter_api_key="", correction_log_repo=correction_log_repo
     )
 
 
@@ -224,7 +224,7 @@ def test_correction_log_repo_none_leaves_behavior_unchanged(session):
         session, artist_bucket_key="artistx"
     )
     ruled = CandidatePlaylist(
-        id=999, name="High Energy", rule={"bpm_min": 150}, description=None, artist_counts={}
+        id=999, name="High Energy", rule={"genre": "electronic"}, description=None, artist_counts={}
     )
     service_without_repo = _service()
     service_with_repo = _service(correction_log_repo=CorrectionLogRepository(session))
@@ -233,8 +233,8 @@ def test_correction_log_repo_none_leaves_behavior_unchanged(session):
     results_without = service_without_repo.classify_track(track, [ruled])
     results_with = service_with_repo.classify_track(track, [ruled], user_id=user.id)
 
-    # Rule rejects (bpm is None here, so bpm_min=150 fails) regardless of the
-    # correction-log repo being wired in.
+    # Rule rejects (genre is None here, so genre=electronic fails) regardless
+    # of the correction-log repo being wired in.
     assert results_without[0].playlist_id is None
     assert results_with[0].playlist_id is None
     assert results_without[0].explanation.signal == "none"

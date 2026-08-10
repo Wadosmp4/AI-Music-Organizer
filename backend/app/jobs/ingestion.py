@@ -12,20 +12,30 @@ same backlog songs.
 
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session
+
+from app.core.db import get_engine
 from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
-from app.integrations.youtube_data_api_client import track_artist
+from app.integrations.youtube_data_api_client import YouTubeDataApiClient, track_artist
 from app.models.library import LibraryItem
 from app.models.review_queue import ReviewQueueItem
+from app.models.user import User
+from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository, VersionConflictError
 from app.repositories.user_repository import UserRepository
-from app.services.classification import ClassificationService, build_candidate
+from app.services.classification import ClassificationService, build_candidate, classify_tracks_concurrently
+from app.services.genre_lookup import GenreLookupService
 
-# Bounded per call so a single request can't burst GetSongBPM's 3,000/hour
-# ceiling (KTD21) — the caller repeats the check until backfill_complete.
-BACKFILL_BATCH_SIZE = 50
+# Bounded per call so one request doesn't do unbounded classification work
+# (a live LLM/description-match call per song) in one go (KTD21) — the
+# caller repeats the check until backfill_complete. Kept small (rather than
+# e.g. 50) so run_ingestion_check_to_completion's per-batch progress write
+# is visible to the poll endpoint more often during a large backlog run.
+BACKFILL_BATCH_SIZE = 20
 
 _ACTIVE_QUEUE_STATUSES = {"pending", "write_pending", "approved_pending_apply"}
 
@@ -47,6 +57,11 @@ class IngestionCheckResult:
     queue_items_created: int
     songs_marked_removed: int
     backfill_complete: bool  # only meaningful when mode == "backfill"
+    # Total new songs pending this run, before this call's batch cap (i.e.
+    # len(all_new_songs)) -- lets a caller looping this function capture a
+    # stable "out of how many" denominator from its first call, the same way
+    # Reorganize's total_count is captured once from its own full snapshot.
+    total_new_songs_found: int = 0
 
 
 def run_ingestion_check(
@@ -57,6 +72,8 @@ def run_ingestion_check(
     review_queue_repository: ReviewQueueRepository,
     user_repository: UserRepository,
     user_id: int,
+    engine=None,
+    candidates=None,
 ) -> IngestionCheckResult:
     user = user_repository.get(user_id)
     if user is None or user.onboarding_completed_at is None:
@@ -104,6 +121,12 @@ def run_ingestion_check(
         existing_items, liked_video_ids, queue_items_snapshot, library_repository, review_queue_repository
     )
 
+    # Every (library_item, playlist) pair that already has an active or
+    # committed candidate row -- mirrors reorganize_matching.py's own dedup
+    # (KTD8), so a retry/race here can't create a second pending candidate
+    # for a pair that's already queued, approved, or written.
+    active_pairs = review_queue_repository.active_pairs_for_user(user_id)
+
     all_new_songs = [
         s for s in liked_songs if s.get("videoId") and s["videoId"] not in existing_video_ids
     ]
@@ -114,16 +137,29 @@ def run_ingestion_check(
     limit = BACKFILL_BATCH_SIZE
     new_songs = all_new_songs[:limit]
 
-    candidates = [
-        build_candidate(music_client, classification_service, playlist_repository, p)
-        for p in playlist_repository.list_for_user(user_id)
-    ]
+    # `candidates` lets a caller looping this function (e.g.
+    # run_ingestion_check_to_completion) build the candidate playlists' real
+    # YouTube content once per run instead of every batch -- omitted (the
+    # default, and every existing test call site), this rebuilds them here
+    # exactly as before.
+    if candidates is None:
+        candidates = [
+            build_candidate(music_client, classification_service, playlist_repository, p)
+            for p in playlist_repository.list_for_user(user_id)
+        ]
+
+    # `engine`, when given, fans these classify_track calls out across a
+    # bounded thread pool instead of running them one at a time (see
+    # classify_tracks_concurrently) -- each song's LLM description-match call
+    # is independent, and this is the dominant per-batch cost. `None` (every
+    # existing test call site) keeps the original single-threaded loop.
+    classify_results = classify_tracks_concurrently(
+        new_songs, candidates, classification_service, user_id, engine=engine
+    )
 
     queue_items_created = 0
-    for song in new_songs:
-        try:
-            results = classification_service.classify_track(song, candidates, user_id=user_id)
-        except Exception:
+    for song, results in zip(new_songs, classify_results):
+        if results is None:
             # KTD18: this song's failure never blocks the rest of the check.
             # The LibraryItem row is deliberately NOT created here — creating
             # it before classification, then skipping on failure, would add
@@ -132,14 +168,27 @@ def run_ingestion_check(
             # forever instead of actually retrying it as intended.
             continue
 
-        library_item = library_repository.create(
-            LibraryItem(
-                user_id=user_id,
-                video_id=song["videoId"],
-                title=song.get("title", ""),
-                artist=track_artist(song),
+        try:
+            library_item = library_repository.create(
+                LibraryItem(
+                    user_id=user_id,
+                    video_id=song["videoId"],
+                    title=song.get("title", ""),
+                    artist=track_artist(song),
+                )
             )
-        )
+        except IntegrityError:
+            # A concurrent check (e.g. a double-clicked retry) already
+            # created this LibraryItem between this call's existing_video_ids
+            # snapshot and this insert -- roll back the failed insert and
+            # reuse the row the other call created instead of crashing the
+            # whole check over one race (KTD18-style: one item's conflict
+            # shouldn't block the rest).
+            library_repository.session.rollback()
+            existing = library_repository.get_by_video_id(song["videoId"])
+            if existing is None:
+                continue  # genuinely unexpected; skip this song this pass
+            library_item = existing
 
         # One queue item per matched playlist -- a song can belong to more
         # than one -- or a single unassigned one when `results` is the
@@ -150,6 +199,9 @@ def run_ingestion_check(
         # Queue's "Unassigned" group instead, where it can be added to a
         # playlist like any other item.
         for result in results:
+            pair = (library_item.id, result.playlist_id)
+            if result.playlist_id is not None and pair in active_pairs:
+                continue  # already an active/committed candidate there
             review_queue_repository.create(
                 ReviewQueueItem(
                     user_id=user_id,
@@ -160,6 +212,8 @@ def run_ingestion_check(
                 )
             )
             queue_items_created += 1
+            if result.playlist_id is not None:
+                active_pairs.add(pair)
 
     backfill_complete = False
     if is_backfill and len(all_new_songs) <= limit:
@@ -173,7 +227,130 @@ def run_ingestion_check(
         queue_items_created=queue_items_created,
         songs_marked_removed=songs_marked_removed,
         backfill_complete=backfill_complete,
+        total_new_songs_found=len(all_new_songs),
     )
+
+
+class IngestionAlreadyInProgressError(Exception):
+    """Raised by trigger_ingestion_check when this user's own ingestion run
+    is already in progress -- mirrors MatchingAlreadyInProgressError /
+    ApplyAlreadyInProgressError so a rapid double-click on "Load new songs"
+    can't get two concurrent runs past this synchronous pre-flight check."""
+
+
+def trigger_ingestion_check(user_repository: UserRepository, user_id: int) -> User:
+    """Synchronous pre-flight for the ingestion-check trigger endpoint:
+    claims the concurrent-run guard before the background task starts,
+    mirroring reorganize_matching.trigger_matching."""
+    user = user_repository.get(user_id)
+    if user.ingestion_status == "in_progress":
+        raise IngestionAlreadyInProgressError(
+            f"ingestion check for user {user_id} already in progress"
+        )
+    return user_repository.set_ingestion_progress(user_id, status="in_progress", processed=0, total=0)
+
+
+def run_ingestion_check_to_completion(
+    user_id: int,
+    engine=None,
+    music_client=None,
+    classification_service=None,
+) -> None:
+    """Background task (mirrors run_reorganize_matching's pattern): loops
+    run_ingestion_check's own bounded batch until this run has nothing left
+    to process, persisting progress after each batch so the poll endpoint
+    has something durable to read. Replaces the old frontend-driven "click
+    Load next 50 songs repeatedly" flow -- a user with a large backlog or a
+    big burst of newly-liked songs no longer has to babysit it one batch at
+    a time, and a page navigation or closed tab no longer abandons it
+    mid-run.
+
+    `engine`/`music_client`/`classification_service` follow the same
+    injectable-for-tests pattern as run_reorganize_matching: leaving
+    `classification_service` unset builds a real one reading real API keys
+    from Settings, which isn't guarded by mocking `completion`/`requests.get`
+    at this call site, so an unset value in a test can make a real, billed
+    API call whenever real keys happen to be configured. Always pass it
+    explicitly from a test.
+    """
+    engine = engine or get_engine()
+    music_client = music_client or YouTubeDataApiClient()
+    with Session(engine) as db_session:
+        library_repository = LibraryRepository(db_session)
+        playlist_repository = PlaylistRepository(db_session)
+        review_queue_repository = ReviewQueueRepository(db_session)
+        user_repository = UserRepository(db_session)
+        # Per-song classification only runs concurrently (see
+        # classify_tracks_concurrently) when this function built
+        # classification_service itself -- guaranteed real, so a worker
+        # thread can safely reconstruct an independent copy of it bound to
+        # its own DB session. A caller-supplied one (every test, per this
+        # docstring's own "always pass it explicitly from a test") might be
+        # a mock; reconstructing from a mock's attributes would either raise
+        # or silently ignore the mock's configured behavior, so
+        # parallel_engine stays None in that case and run_ingestion_check
+        # falls back to its original single-threaded loop.
+        parallel_engine = None
+        if classification_service is None:
+            genre_lookup = GenreLookupService(db_session)
+            classification_service = ClassificationService(
+                genre_lookup, correction_log_repo=CorrectionLogRepository(db_session)
+            )
+            parallel_engine = engine
+
+        # Built once for the whole run rather than every batch: each
+        # candidate's real YouTube track list was previously refetched on
+        # every single run_ingestion_check call, which for a large backlog
+        # meant a full re-fetch of every managed playlist every ~20 songs --
+        # the dominant per-batch cost. Slightly stale within one run if a
+        # playlist's real content changes mid-run (e.g. the user manually
+        # approves a Review Queue item while a big backfill is still going)
+        # -- self-corrects on the next trigger, same tradeoff the reorganize
+        # matching loop below now also takes.
+        candidates = [
+            build_candidate(music_client, classification_service, playlist_repository, p)
+            for p in playlist_repository.list_for_user(user_id)
+        ]
+
+        processed = 0
+        total_known = False
+        while True:
+            result = run_ingestion_check(
+                music_client=music_client,
+                classification_service=classification_service,
+                library_repository=library_repository,
+                playlist_repository=playlist_repository,
+                review_queue_repository=review_queue_repository,
+                user_repository=user_repository,
+                user_id=user_id,
+                engine=parallel_engine,
+                candidates=candidates,
+            )
+            if not result.ran:
+                break
+
+            if not total_known:
+                # Captured once, from the first batch's pre-cap count -- a
+                # stable "out of how many" denominator for the whole run,
+                # the same way Reorganize's total_count is fixed from its
+                # own initial full-library snapshot.
+                user_repository.set_ingestion_progress(user_id, total=result.total_new_songs_found)
+                total_known = True
+            processed += result.new_songs_found
+            user_repository.set_ingestion_progress(user_id, processed=processed)
+
+            if result.mode == "backfill":
+                if result.backfill_complete:
+                    break
+            elif result.new_songs_found < BACKFILL_BATCH_SIZE:
+                break
+            if result.new_songs_found == 0:
+                # Safety net: a batch that made no progress at all (e.g. a
+                # persistent get_liked_songs failure) would otherwise loop
+                # forever retrying the exact same call.
+                break
+
+        user_repository.set_ingestion_progress(user_id, status="done")
 
 
 @dataclass

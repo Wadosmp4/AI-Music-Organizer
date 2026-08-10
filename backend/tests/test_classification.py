@@ -1,18 +1,19 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-import requests
 
 from app.integrations.base import MusicServiceClient
 from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.models.playlist import Playlist
 from app.repositories.playlist_repository import PlaylistRepository
-from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
 from app.services.classification import (
     CandidatePlaylist,
+    ClassificationResult,
     ClassificationService,
+    Explanation,
     build_artist_counts,
     build_candidate,
+    classify_tracks_concurrently,
 )
 from app.services.genre_lookup import GenreLookupService
 
@@ -20,20 +21,19 @@ from app.services.genre_lookup import GenreLookupService
 @pytest.fixture(autouse=True)
 def reset_dependency_health():
     dependency_health_store.set_status("lastfm", DependencyStatus.OK)
-    dependency_health_store.set_status("getsongbpm", DependencyStatus.OK)
-    dependency_health_store.set_status("llm_bpm_estimate", DependencyStatus.OK)
     dependency_health_store.set_status("llm_description_match", DependencyStatus.OK)
     dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
     yield
 
 
-def _service(genre=None, bpm_result=None):
+def _service(genre=None):
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = genre
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = bpm_result or BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = None
-    return ClassificationService(genre_lookup, bpm_lookup)
+    # Explicit "" (not the default None): None now falls through to
+    # get_settings().openrouter_api_key, which could pick up a real key from
+    # the process environment and make a real, billed API call during a
+    # test that never mocks completion().
+    return ClassificationService(genre_lookup, openrouter_api_key="")
 
 
 def test_every_suggestion_carries_a_confidence_score():
@@ -47,103 +47,17 @@ def test_every_suggestion_carries_a_confidence_score():
     assert 0.0 <= results[0].confidence <= 1.0
 
 
-def test_bpm_lookup_hit_returns_measured_value():
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key=None)
-    fake_response = MagicMock(status_code=200)
-    fake_response.json.return_value = {"search": [{"tempo": "128"}]}
-
-    with patch("app.services.bpm_lookup.requests.get", return_value=fake_response):
-        result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm == 128.0
-    assert result.source == "measured"
-
-
-def test_bpm_miss_falls_back_to_flagged_llm_estimate():
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="or-key")
-    fake_response = MagicMock(status_code=200)
-    fake_response.json.return_value = {"search": []}
-
-    mock_completion_resp = MagicMock()
-    mock_completion_resp.choices[0].message.content = '{"bpm": 140.0}'
-
-    with patch("app.services.bpm_lookup.requests.get", return_value=fake_response):
-        with patch("app.services.bpm_lookup.completion", return_value=mock_completion_resp):
-            result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm == 140.0
-    assert result.source == "estimated"
-
-
-def test_bpm_rate_limit_is_distinguishable_from_genuine_miss():
-    # openrouter_api_key="" explicitly disables the LLM fallback — passing None
-    # would fall through to get_settings() and could pick up a real key from
-    # the process environment, making a real paid API call during a test.
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
-    rate_limited_response = MagicMock(status_code=429)
-
-    with patch("app.services.bpm_lookup.requests.get", return_value=rate_limited_response):
-        result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm is None
-    status, reason = dependency_health_store.get_status("getsongbpm")
-    assert status == DependencyStatus.DEGRADED
-    assert "rate limit" in reason.lower()
-
-
-def test_bpm_network_timeout_surfaces_degraded_health():
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
-
-    with patch("app.services.bpm_lookup.requests.get", side_effect=requests.Timeout("timed out")):
-        result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm is None
-    status, reason = dependency_health_store.get_status("getsongbpm")
-    assert status == DependencyStatus.DEGRADED
-    assert "timed out" in reason.lower() or "failed" in reason.lower()
-
-
-def test_bpm_tripped_circuit_breaker_is_distinguishable_from_genuine_miss():
-    """CircuitOpenError is raised by call_with_retry's circuit_breaker.before_call(),
-    not by the request itself — it must be caught alongside requests.RequestException
-    or it escapes _lookup_measured uncaught (KTD18)."""
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
-    for _ in range(bpm_service._circuit_breaker.failure_threshold):
-        bpm_service._circuit_breaker.record_failure()
-
-    result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm is None
-    status, reason = dependency_health_store.get_status("getsongbpm")
-    assert status == DependencyStatus.DEGRADED
-    assert "circuit" in reason.lower()
-
-
-def test_bpm_malformed_tempo_field_surfaces_degraded_health_instead_of_raising():
-    bpm_service = BpmLookupService(api_key="test-key", openrouter_api_key="")
-    fake_response = MagicMock(status_code=200)
-    fake_response.raise_for_status.return_value = None
-    fake_response.json.return_value = {"search": [{"tempo": "not-a-number"}]}
-
-    with patch("app.services.bpm_lookup.requests.get", return_value=fake_response):
-        result = bpm_service.lookup_bpm("Artist", "Title")
-
-    assert result.bpm is None
-    status, reason = dependency_health_store.get_status("getsongbpm")
-    assert status == DependencyStatus.DEGRADED
-    assert "tempo" in reason.lower()
-
-
 def test_rule_gated_playlist_ignores_description_only_match():
     ruled = CandidatePlaylist(
-        id=1, name="High Energy", rule={"bpm_min": 150}, description="chill background music", artist_counts={}
+        id=1, name="Electronic Only", rule={"genre": "electronic"}, description="chill background music", artist_counts={}
     )
-    service = _service(bpm_result=BpmLookupResult(bpm=90.0, source="measured"))
+    service = _service(genre="rock")
 
     results = service.classify_track({"title": "Slow Song", "artists": [{"name": "Someone"}]}, [ruled])
 
-    # The rule (bpm_min=150) rejects this 90bpm song outright; its description
-    # ("chill background music") must not be used to route it there anyway (KTD10).
+    # The rule (genre=electronic) rejects this rock song outright; its
+    # description ("chill background music") must not be used to route it
+    # there anyway (KTD10).
     assert len(results) == 1
     assert results[0].playlist_id is None
     assert results[0].explanation.signal == "none"
@@ -179,10 +93,7 @@ def test_single_song_llm_failure_does_not_raise_and_falls_through():
     )
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = "or-key"
-    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
 
     with patch(
         "app.services.classification.call_with_retry", side_effect=RuntimeError("timeout")
@@ -207,6 +118,90 @@ def test_single_song_llm_failure_does_not_raise_and_falls_through():
             {"title": "Other Song", "artists": [{"name": "Nobody"}]}, [playlist]
         )
     assert second_results[0].explanation.signal == "none"
+
+
+def test_classify_tracks_concurrently_without_an_engine_uses_the_given_service_in_order():
+    """Default (engine=None, every pre-existing call site): a plain
+    sequential loop against the exact classification_service object given --
+    proves a mocked service's configured return_value still drives the
+    result, not a reconstructed one."""
+    tracks = [{"videoId": f"v{i}", "title": f"Song {i}"} for i in range(3)]
+    service = MagicMock(spec=ClassificationService)
+    service.classify_track.side_effect = lambda track, candidates, user_id: [
+        ClassificationResult(
+            playlist_id=1, confidence=0.9, explanation=Explanation("rule", track["videoId"]), genre=None
+        )
+    ]
+
+    results = classify_tracks_concurrently(tracks, [], service, user_id=None)
+
+    assert [r[0].explanation.detail for r in results] == ["v0", "v1", "v2"]
+
+
+def test_classify_tracks_concurrently_without_an_engine_isolates_one_failure():
+    tracks = [{"videoId": "v0"}, {"videoId": "v1"}, {"videoId": "v2"}]
+    service = MagicMock(spec=ClassificationService)
+
+    def _classify(track, candidates, user_id):
+        if track["videoId"] == "v1":
+            raise RuntimeError("boom")
+        return [ClassificationResult(playlist_id=1, confidence=0.5, explanation=Explanation("rule", "x"), genre=None)]
+
+    service.classify_track.side_effect = _classify
+
+    results = classify_tracks_concurrently(tracks, [], service, user_id=None)
+
+    assert results[0] is not None
+    assert results[1] is None  # KTD18: this track's failure doesn't raise or drop the others
+    assert results[2] is not None
+
+
+def test_classify_tracks_concurrently_with_an_engine_classifies_every_track_independently(engine):
+    """The concurrent path (engine given): each worker builds its own
+    ClassificationService bound to its own DB session rather than sharing
+    the caller's -- verified end to end with a real ClassificationService
+    (openrouter_api_key="" so no real LLM call is possible) against the
+    real per-track artist-similarity signal, across enough tracks to
+    exercise the thread pool.
+
+    Patches get_settings so every worker's independently-constructed
+    GenreLookupService sees lastfm_api_key="" regardless of what's actually
+    configured in this environment -- each worker builds its own
+    GenreLookupService straight from Settings (see
+    classify_tracks_concurrently), not from anything this test can pass in
+    directly, so this is the only way to keep the test's genre lookups from
+    making a real, non-deterministic Last.fm call. (The concurrent
+    genre-cache-write race this surfaced during development is covered
+    directly and deterministically by
+    test_genre_cache_upsert_recovers_from_a_concurrent_insert_race below,
+    without needing real threads or a real Last.fm key.)
+    """
+    playlist = CandidatePlaylist(
+        id=7, name="Rock", rule=None, description=None, artist_counts={"queen": 5, "abba": 5}
+    )
+    genre_lookup = MagicMock(spec=GenreLookupService)
+    genre_lookup.genre_for.return_value = None
+    service = ClassificationService(genre_lookup, openrouter_api_key="")
+
+    tracks = [
+        {"title": "Bohemian Rhapsody", "artists": [{"name": "Queen"}]},
+        {"title": "Dancing Queen", "artists": [{"name": "ABBA"}]},
+        {"title": "Unknown Song", "artists": [{"name": "Some Random Artist"}]},
+    ] * 4  # 12 tracks, comfortably more than CLASSIFY_MAX_WORKERS
+
+    fake_settings = MagicMock(lastfm_api_key="")
+    with patch("app.services.genre_lookup.get_settings", return_value=fake_settings):
+        results = classify_tracks_concurrently(tracks, [playlist], service, user_id=None, engine=engine)
+
+    assert len(results) == len(tracks)
+    for track, track_results in zip(tracks, results):
+        assert track_results is not None
+        artist = track["artists"][0]["name"].lower()
+        if artist in {"queen", "abba"}:
+            assert track_results[0].playlist_id == 7
+            assert track_results[0].explanation.signal == "artist_similarity"
+        else:
+            assert track_results[0].playlist_id is None
 
 
 def test_golden_set_artist_similarity_routes_to_existing_themed_playlist():
@@ -250,8 +245,7 @@ def test_genre_lookup_caches_to_the_database_not_a_file(session):
 
 
 def test_genre_lookup_tripped_circuit_breaker_is_distinguishable_from_genuine_miss(session):
-    """Same CircuitOpenError gap as bpm_lookup.py's _lookup_measured — it's
-    raised by call_with_retry's circuit_breaker.before_call(), not by the
+    """Raised by call_with_retry's circuit_breaker.before_call(), not by the
     request itself, so it must be caught alongside requests.RequestException."""
     genre_service = GenreLookupService(session, api_key="test-key")
     for _ in range(genre_service._circuit_breaker.failure_threshold):
@@ -323,9 +317,7 @@ def test_a_song_can_match_more_than_one_playlist_at_once():
     )
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
 
     mock_response = MagicMock()
     mock_response.choices[0].message.content = '{"matched_playlists": ["Arena Rock Anthems"]}'
@@ -348,9 +340,7 @@ def test_a_playlist_matched_via_description_is_not_also_reported_via_artist_simi
     )
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
 
     mock_response = MagicMock()
     mock_response.choices[0].message.content = '{"matched_playlists": ["Arena Rock Anthems"]}'
@@ -363,9 +353,7 @@ def test_a_playlist_matched_via_description_is_not_also_reported_via_artist_simi
 
 def test_generate_vibe_description_summarizes_the_tracks():
     genre_lookup = MagicMock(spec=GenreLookupService)
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
     tracks = [{"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}]
 
     mock_response = MagicMock()
@@ -378,15 +366,15 @@ def test_generate_vibe_description_summarizes_the_tracks():
 
 def test_generate_vibe_description_is_none_without_an_llm_key_or_tracks():
     genre_lookup = MagicMock(spec=GenreLookupService)
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = None
     track = {"videoId": "v1", "title": "t", "artists": [{"name": "a"}]}
 
-    no_key_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key=None)
+    # Explicit "" (not None): None now falls through to
+    # get_settings().openrouter_api_key, which could pick up a real key from
+    # the process environment and make a real, billed API call here.
+    no_key_service = ClassificationService(genre_lookup, openrouter_api_key="")
     assert no_key_service.generate_vibe_description([track]) is None
 
-    keyed_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    keyed_service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
     assert keyed_service.generate_vibe_description([]) is None
 
 
@@ -408,9 +396,7 @@ def test_build_candidate_backfills_a_missing_description_from_real_playlist_cont
         {"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}
     ]
     genre_lookup = MagicMock(spec=GenreLookupService)
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    classification_service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
 
     mock_response = MagicMock()
     mock_response.choices[0].message.content = "French house vibes."
@@ -445,12 +431,46 @@ def test_build_candidate_does_not_overwrite_an_existing_description(session):
         {"videoId": "v1", "title": "Song", "artists": [{"name": "Daft Punk"}]}
     ]
     genre_lookup = MagicMock(spec=GenreLookupService)
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    classification_service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
 
     with patch("app.services.classification.completion") as mock_completion:
         candidate = build_candidate(music_client, classification_service, playlist_repo, playlist)
 
     mock_completion.assert_not_called()
     assert candidate.description == "already has a vibe"
+
+
+def test_genre_cache_upsert_recovers_from_a_concurrent_insert_race(engine):
+    """classify_tracks_concurrently's worker threads each open their own DB
+    session, so two workers classifying songs by the same not-yet-cached
+    artist can both miss GenreCacheRepository's read and race to insert the
+    same artist -- reproduced directly and deterministically here (no real
+    threads or network calls needed) by simulating the interleaving two
+    separate sessions/repositories against the same underlying artist row.
+    Before this fix, the loser's IntegrityError propagated out of
+    classify_track and silently dropped that song's whole classification
+    result (KTD18's broad except treats any failure as "retry next batch").
+    """
+    from sqlmodel import Session
+
+    from app.repositories.genre_cache_repository import GenreCacheRepository
+
+    with Session(engine) as session_a, Session(engine) as session_b:
+        repo_a = GenreCacheRepository(session_a)
+        repo_b = GenreCacheRepository(session_b)
+
+        # Both "workers" miss the cache before either has written anything.
+        assert repo_a.get("Queen") is None
+        assert repo_b.get("Queen") is None
+
+        # The first writer commits its insert...
+        repo_a.upsert("Queen", "classic rock")
+
+        # ...and the second, having already missed the cache, must recover
+        # from the resulting UNIQUE constraint violation instead of raising.
+        recovered = repo_b.upsert("Queen", "classic rock")
+
+    assert recovered.artist == "Queen"
+    assert recovered.genre == "classic rock"
+    with Session(engine) as verify_session:
+        assert GenreCacheRepository(verify_session).get("Queen") is not None

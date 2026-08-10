@@ -11,6 +11,9 @@ __pycache__/
 backend/data/
 .pytest_cache/
 
+# Local DB safety-net snapshots (raw personal data, never source)
+.backups/
+
 # Node
 node_modules/
 dist/

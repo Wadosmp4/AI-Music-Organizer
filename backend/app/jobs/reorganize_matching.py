@@ -22,19 +22,50 @@ is distinct), which is what re-running reorganize (AE4) relies on.
 
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
+from sqlmodel import Session
+
+from app.core.db import get_engine
 from app.integrations.base import MusicServiceClient
-from app.integrations.youtube_data_api_client import track_artist
+from app.integrations.youtube_data_api_client import YouTubeDataApiClient, track_artist
 from app.models.library import LibraryItem
 from app.models.review_queue import ReviewQueueItem
+from app.repositories.correction_log_repository import CorrectionLogRepository
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.reorganize_session_repository import ReorganizeSessionRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
-from app.services.classification import ClassificationService, build_candidate
+from app.services.classification import ClassificationService, build_candidate, classify_tracks_concurrently
+from app.services.genre_lookup import GenreLookupService
+from app.services.reorganize_apply import ReorganizeSessionNotFoundError
 
 # Same shape as jobs/ingestion.py's BACKFILL_BATCH_SIZE (KTD8) -- bounded so a
-# single request can't burst GetSongBPM's rate ceiling.
-MATCHING_BATCH_SIZE = 50
+# single request doesn't do unbounded classification work in one go, and kept
+# small so per-batch progress is visible to the poll endpoint more often.
+MATCHING_BATCH_SIZE = 20
+
+
+class MatchingAlreadyInProgressError(Exception):
+    """Raised by trigger_matching (U4 follow-up) when a session's own
+    matching run is already in progress -- mirrors reorganize_apply's
+    ApplyAlreadyInProgressError (KTD10) so a rapid double-click on "Finish
+    setup" can't get two concurrent matching runs past this synchronous
+    pre-flight check."""
+
+
+def trigger_matching(reorganize_session_repository: ReorganizeSessionRepository, reorganize_session_id: int, user_id: int):
+    """Synchronous pre-flight for the matching trigger endpoint: validates
+    the session and claims the concurrent-matching guard before the
+    background task starts, mirroring reorganize_apply.trigger_apply."""
+    reorganize_session = reorganize_session_repository.get(reorganize_session_id)
+    if reorganize_session is None or reorganize_session.user_id != user_id:
+        raise ReorganizeSessionNotFoundError(f"reorganize session {reorganize_session_id} not found")
+    if reorganize_session.matching_status == "in_progress":
+        raise MatchingAlreadyInProgressError(
+            f"reorganize session {reorganize_session_id} already has matching in progress"
+        )
+    reorganize_session.matching_status = "in_progress"
+    return reorganize_session_repository.update(reorganize_session)
 
 
 @dataclass
@@ -54,6 +85,8 @@ def run_reorganize_matching_batch(
     reorganize_session_repository: ReorganizeSessionRepository,
     user_id: int,
     reorganize_session_id: int,
+    engine=None,
+    candidates=None,
 ) -> ReorganizeMatchingResult:
     reorganize_session = reorganize_session_repository.get(reorganize_session_id)
     if reorganize_session is None or reorganize_session.user_id != user_id:
@@ -88,13 +121,21 @@ def run_reorganize_matching_batch(
     ]
     batch = pending_video_ids[:MATCHING_BATCH_SIZE]
 
-    candidates = [
-        build_candidate(music_client, classification_service, playlist_repository, p)
-        for p in playlist_repository.list_for_user(user_id)
-    ]
+    # `candidates` lets a caller looping this function (run_reorganize_matching)
+    # build the candidate playlists' real YouTube content once per run
+    # instead of every batch -- omitted (the default, and every existing
+    # test call site), this rebuilds them here exactly as before.
+    if candidates is None:
+        candidates = [
+            build_candidate(music_client, classification_service, playlist_repository, p)
+            for p in playlist_repository.list_for_user(user_id)
+        ]
 
-    queue_items_created = 0
-    processed = 0
+    # Phase 1 (sequential DB writes): resolve or create each batch song's
+    # LibraryItem row -- classify_track below is read-mostly and safe to
+    # parallelize (see classify_tracks_concurrently), but a row insert must
+    # stay serialized against this function's own session.
+    batch_songs = []
     for video_id in batch:
         song = songs_by_video_id.get(video_id)
         if song is None:
@@ -105,19 +146,45 @@ def run_reorganize_matching_batch(
 
         library_item = existing_by_video_id.get(video_id)
         if library_item is None:
-            library_item = library_repository.create(
-                LibraryItem(
-                    user_id=user_id,
-                    video_id=song["videoId"],
-                    title=song.get("title", ""),
-                    artist=track_artist(song),
+            try:
+                library_item = library_repository.create(
+                    LibraryItem(
+                        user_id=user_id,
+                        video_id=song["videoId"],
+                        title=song.get("title", ""),
+                        artist=track_artist(song),
+                    )
                 )
-            )
+            except IntegrityError:
+                # A concurrent call for this user (a double-clicked "Finish
+                # setup", or an overlapping retry after the UI looked stuck
+                # on a slow batch -- each batch classifies up to
+                # MATCHING_BATCH_SIZE songs one at a time, which can take
+                # minutes) already created this LibraryItem between our
+                # existing_by_video_id snapshot at the top of this call and
+                # this insert. Roll back the failed insert and reuse the row
+                # the other call created instead of crashing the whole batch
+                # over one race (KTD18-style: one item's conflict shouldn't
+                # block the rest).
+                library_repository.session.rollback()
+                library_item = library_repository.get_by_video_id(video_id)
+                if library_item is None:
+                    continue  # genuinely unexpected; skip this song this pass
             existing_by_video_id[video_id] = library_item
 
-        try:
-            results = classification_service.classify_track(song, candidates, user_id=user_id)
-        except Exception:
+        batch_songs.append((song, library_item))
+
+    # Phase 2 (parallel when `engine` is given): each song's classify_track
+    # call is independent and dominated by a live LLM network round-trip.
+    classify_results = classify_tracks_concurrently(
+        [song for song, _ in batch_songs], candidates, classification_service, user_id, engine=engine
+    )
+
+    # Phase 3 (sequential DB writes): one review_queue_item per matched result.
+    queue_items_created = 0
+    processed = 0
+    for (song, library_item), results in zip(batch_songs, classify_results):
+        if results is None:
             # KTD18-style: this song's failure never blocks the rest of the
             # batch; it simply isn't marked processed, so a later batch
             # retries it.
@@ -152,3 +219,107 @@ def run_reorganize_matching_batch(
         queue_items_created=queue_items_created,
         matching_complete=matching_complete,
     )
+
+
+def run_reorganize_matching(
+    reorganize_session_id: int, user_id: int, engine=None, music_client=None, classification_service=None
+) -> None:
+    """Background task (U4 follow-up, mirrors run_reorganize_clustering's
+    pattern in library_analysis.py): triggered via FastAPI's
+    `BackgroundTasks` after the trigger endpoint responds, so it opens its
+    own DB session rather than reusing the (already-closed) request session.
+    `engine`/`music_client` follow the same injectable-for-tests pattern.
+    `classification_service` follows it too, and injecting it in tests isn't
+    optional: leaving it unset builds a real one reading real API keys from Settings,
+    which isn't guarded by mocking `completion`/`requests.get` at this call
+    site, so an unset `classification_service` in a test can make a real,
+    billed API call whenever real keys happen to be configured.
+
+    Loops `run_reorganize_matching_batch` to completion, persisting
+    `matched_count` progress after each batch so the poll endpoint has
+    something durable to read. Replaces the old frontend-driven "call one
+    batch, wait, call again" loop -- discovered the hard way that a single
+    batch (up to MATCHING_BATCH_SIZE songs, each needing a live
+    classification call) can take minutes, and a page navigation or closed
+    tab used to abandon the loop mid-run with no way to resume it. Also
+    means the frontend no longer needs to be the thing driving retries,
+    which is what let two overlapping batches race to create the same
+    LibraryItem in the first place (see reorganize_matching_batch's
+    IntegrityError handling).
+    """
+    engine = engine or get_engine()
+    music_client = music_client or YouTubeDataApiClient()
+    with Session(engine) as db_session:
+        reorganize_session_repo = ReorganizeSessionRepository(db_session)
+        library_repo = LibraryRepository(db_session)
+        playlist_repo = PlaylistRepository(db_session)
+        review_queue_repo = ReviewQueueRepository(db_session)
+        # Per-song classification only runs concurrently (see
+        # classify_tracks_concurrently) when this function built
+        # classification_service itself -- guaranteed real, so a worker
+        # thread can safely reconstruct an independent copy of it bound to
+        # its own DB session. A caller-supplied one (every test, per this
+        # docstring's own "injecting it in tests isn't optional") might be a
+        # mock; reconstructing from a mock's attributes would either raise
+        # or silently ignore the mock's configured behavior, so
+        # parallel_engine stays None in that case and
+        # run_reorganize_matching_batch falls back to its original
+        # single-threaded loop.
+        parallel_engine = None
+        if classification_service is None:
+            genre_lookup = GenreLookupService(db_session)
+            classification_service = ClassificationService(
+                genre_lookup, correction_log_repo=CorrectionLogRepository(db_session)
+            )
+            parallel_engine = engine
+
+        reorganize_session = reorganize_session_repo.get(reorganize_session_id)
+        if reorganize_session is None:
+            return
+        reorganize_session.matched_count = 0
+        reorganize_session_repo.update(reorganize_session)
+
+        # Built once for the whole run rather than every batch -- each
+        # candidate's real YouTube track list was previously refetched on
+        # every single run_reorganize_matching_batch call (same cost
+        # jobs/ingestion.py's completion loop just fixed). Slightly stale
+        # within one run if a playlist's real content changes mid-run --
+        # self-corrects on the next trigger.
+        candidates = [
+            build_candidate(music_client, classification_service, playlist_repo, p)
+            for p in playlist_repo.list_for_user(user_id)
+        ]
+
+        while True:
+            result = run_reorganize_matching_batch(
+                music_client=music_client,
+                classification_service=classification_service,
+                library_repository=library_repo,
+                playlist_repository=playlist_repo,
+                review_queue_repository=review_queue_repo,
+                reorganize_session_repository=reorganize_session_repo,
+                user_id=user_id,
+                reorganize_session_id=reorganize_session_id,
+                engine=parallel_engine,
+                candidates=candidates,
+            )
+            if not result.ran:
+                # Session vanished (cancelled mid-run) or the liked-songs
+                # fetch failed -- nothing more to do this pass; leave
+                # matching_status as "in_progress" rather than falsely
+                # marking done, so a future trigger picks it back up.
+                return
+
+            reorganize_session = reorganize_session_repo.get(reorganize_session_id)
+            if reorganize_session is None:
+                return
+            reorganize_session.matched_count += result.processed
+            reorganize_session_repo.update(reorganize_session)
+
+            if result.matching_complete:
+                break
+
+        reorganize_session = reorganize_session_repo.get(reorganize_session_id)
+        if reorganize_session is not None:
+            reorganize_session.matching_status = "done"
+            reorganize_session_repo.update(reorganize_session)

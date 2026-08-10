@@ -8,12 +8,25 @@ services:
         required: false
     environment:
       DATABASE_URL: sqlite:////app/data/app.db
+      QDRANT_URL: http://qdrant:6333
     volumes:
       - sqlite_data:/app/data
+    depends_on:
+      - qdrant
     # Pinned at 1 (KTD22/KTD26): the ingestion job (U4) runs as a single
     # dedicated process. A second replica would double-fire every job.
     deploy:
       replicas: 1
+
+  # Vector store for track embeddings (clustering). Decoupled from the
+  # primary SQLite datastore -- only holds embeddings + metadata needed to
+  # cluster a library, never the source of truth for playlists/review state.
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
 
   web:
     build: ./web
@@ -28,3 +41,4 @@ services:
 
 volumes:
   sqlite_data:
+  qdrant_data:

@@ -1,9 +1,9 @@
 """System-level ingestion/auth health status (U8, KTD6, KTD17, KTD18).
 
 Two independently surfaced states (write path / detection path, KTD17),
-plus the three classification-hot-path dependencies (KTD18) — never
-blended into one signal, so the UI can point the user at the right
-reconnect flow instead of a single ambiguous "something's wrong" banner.
+plus the classification-hot-path dependencies (KTD18) — never blended into
+one signal, so the UI can point the user at the right reconnect flow
+instead of a single ambiguous "something's wrong" banner.
 """
 
 from fastapi import APIRouter
@@ -28,15 +28,13 @@ class AuthStatusResponse(BaseModel):
     # detection_path's OAuth-token-specific failures, also covering plain
     # network errors during that call.
     youtube_detection: StatusResponse
-    # Three independent LLM use cases (KTD17/18: never blend independently-
+    # Two independent LLM use cases (KTD17/18: never blend independently-
     # surfaced health signals) — a persistent failure in one (e.g. clustering)
     # must not be masked by another (e.g. description-match) succeeding right
     # after it against the same shared health-store key.
-    llm_bpm_estimate: StatusResponse
     llm_description_match: StatusResponse
     llm_clustering: StatusResponse
     lastfm: StatusResponse
-    getsongbpm: StatusResponse
 
 
 @router.get("", response_model=AuthStatusResponse)
@@ -46,11 +44,9 @@ def get_auth_status() -> AuthStatusResponse:
     youtube_detection_status, youtube_detection_reason = dependency_health_store.get_status(
         "youtube_detection"
     )
-    llm_bpm_status, llm_bpm_reason = dependency_health_store.get_status("llm_bpm_estimate")
     llm_desc_status, llm_desc_reason = dependency_health_store.get_status("llm_description_match")
     llm_cluster_status, llm_cluster_reason = dependency_health_store.get_status("llm_clustering")
     lastfm_status, lastfm_reason = dependency_health_store.get_status("lastfm")
-    bpm_status, bpm_reason = dependency_health_store.get_status("getsongbpm")
 
     return AuthStatusResponse(
         write_path=StatusResponse(status=write_status.value, reason=write_reason),
@@ -58,9 +54,7 @@ def get_auth_status() -> AuthStatusResponse:
         youtube_detection=StatusResponse(
             status=youtube_detection_status.value, reason=youtube_detection_reason
         ),
-        llm_bpm_estimate=StatusResponse(status=llm_bpm_status.value, reason=llm_bpm_reason),
         llm_description_match=StatusResponse(status=llm_desc_status.value, reason=llm_desc_reason),
         llm_clustering=StatusResponse(status=llm_cluster_status.value, reason=llm_cluster_reason),
         lastfm=StatusResponse(status=lastfm_status.value, reason=lastfm_reason),
-        getsongbpm=StatusResponse(status=bpm_status.value, reason=bpm_reason),
     )

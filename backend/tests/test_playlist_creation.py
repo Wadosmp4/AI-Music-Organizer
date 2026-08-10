@@ -10,7 +10,6 @@ from app.models.user import User
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
 from app.repositories.review_queue_repository import ReviewQueueRepository
-from app.services.bpm_lookup import BpmLookupResult, BpmLookupService
 from app.services.classification import ClassificationResult, ClassificationService, Explanation
 from app.services.genre_lookup import GenreLookupService
 from app.services.playlist_creation import PlaylistCreationService
@@ -19,8 +18,6 @@ from app.services.playlist_creation import PlaylistCreationService
 @pytest.fixture(autouse=True)
 def reset_dependency_health():
     dependency_health_store.set_status("lastfm", DependencyStatus.OK)
-    dependency_health_store.set_status("getsongbpm", DependencyStatus.OK)
-    dependency_health_store.set_status("llm_bpm_estimate", DependencyStatus.OK)
     dependency_health_store.set_status("llm_description_match", DependencyStatus.OK)
     dependency_health_store.set_status("llm_clustering", DependencyStatus.OK)
     yield
@@ -56,8 +53,6 @@ def _no_match_classification_service() -> MagicMock:
         playlist_id=None,
         confidence=0.0,
         explanation=Explanation("none", "no match"),
-        bpm=None,
-        bpm_source=None,
         genre=None,
     )
     return classification_service
@@ -83,6 +78,7 @@ def test_description_persists_and_is_retrievable_after_creation(session):
     # A playlist without a youtube_playlist_id can never be approved/moved
     # into (ReviewQueueService._youtube_playlist_id would 404 every time).
     assert fetched.youtube_playlist_id == "yt-playlist-fake-id"
+    assert fetched.source == "custom"
 
 
 def test_persisted_description_matches_a_later_ingestion_tick(session):
@@ -96,10 +92,7 @@ def test_persisted_description_matches_a_later_ingestion_tick(session):
 
     genre_lookup = MagicMock(spec=GenreLookupService)
     genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=None, source=None)
-    bpm_lookup.openrouter_api_key = "or-key"
-    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    classification_service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
     service = _service(session, classification_service)
 
     result = service.create_playlist_and_propose_matches(
@@ -166,8 +159,6 @@ def test_classify_track_failure_for_one_song_does_not_block_the_rest_of_the_batc
                 playlist_id=playlist.id,
                 confidence=0.8,
                 explanation=Explanation("description_match", "matched"),
-                bpm=None,
-                bpm_source=None,
                 genre=None,
             )
         ]
@@ -198,7 +189,7 @@ def test_rule_gated_existing_playlist_composes_independently_of_new_described_pl
             user_id=user.id,
             name="High Tempo",
             description="fast workout tracks",
-            rule={"bpm_min": 150},
+            rule={"genre": "electronic"},
         )
     )
 
@@ -210,11 +201,8 @@ def test_rule_gated_existing_playlist_composes_independently_of_new_described_pl
     session.refresh(library_item)
 
     genre_lookup = MagicMock(spec=GenreLookupService)
-    genre_lookup.genre_for.return_value = None
-    bpm_lookup = MagicMock(spec=BpmLookupService)
-    bpm_lookup.lookup_bpm.return_value = BpmLookupResult(bpm=80.0, source="measured")  # fails the 150bpm rule
-    bpm_lookup.openrouter_api_key = "or-key"
-    classification_service = ClassificationService(genre_lookup, bpm_lookup, openrouter_api_key="or-key")
+    genre_lookup.genre_for.return_value = None  # fails the genre=electronic rule
+    classification_service = ClassificationService(genre_lookup, openrouter_api_key="or-key")
     service = _service(session, classification_service)
 
     mock_response = MagicMock()
@@ -230,8 +218,9 @@ def test_rule_gated_existing_playlist_composes_independently_of_new_described_pl
     assert items[0].playlist_id == result.playlist.id
     assert items[0].explanation["signal"] == "description_match"
 
-    # The rule-gated playlist got nothing for this song: its rule (bpm_min=150)
-    # rejected the 80bpm song outright, and — per KTD10 — that rejection isn't
-    # reconsidered via the new playlist's description on its own behalf either.
+    # The rule-gated playlist got nothing for this song: its rule
+    # (genre=electronic) rejected the song outright, and — per KTD10 — that
+    # rejection isn't reconsidered via the new playlist's description on its
+    # own behalf either.
     ruled_playlist_items = [i for i in items if i.playlist_id == ruled_playlist.id]
     assert ruled_playlist_items == []
