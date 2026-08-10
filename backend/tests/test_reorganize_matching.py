@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock
 
+from app.integrations.dependency_health import DependencyStatus, dependency_health_store
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
 from app.models.reorganize_session import ReorganizeSession
@@ -479,3 +480,67 @@ def test_run_reorganize_matching_stops_without_marking_done_if_session_is_cancel
     # run_reorganize_matching returned early instead of trying to write a
     # "done" status back onto a session it can no longer find.
     assert reorganize_repo.get(reorganize_session.id) is None
+
+
+def test_run_reorganize_matching_marks_failed_when_liked_songs_fetch_always_fails(session):
+    """R14/KTD2: a background run that never makes any real progress
+    because get_liked_songs() fails on every call must end matching_status
+    == "failed" instead of leaving it stuck at "in_progress" forever, which
+    is what happened before this fix -- the poll endpoint had no way to
+    distinguish a genuinely broken run from a legitimately still-running
+    one."""
+    from app.jobs.reorganize_matching import run_reorganize_matching
+
+    user = _make_user(session)
+    library_repo, playlist_repo, queue_repo, reorganize_repo = _repos(session)
+    reorganize_session = reorganize_repo.create(
+        ReorganizeSession(user_id=user.id, video_id_snapshot=["v1"], clustering_status="done")
+    )
+    classification_service = _classification_service({})
+    music_client = MagicMock()
+    music_client.get_liked_songs.side_effect = RuntimeError("network error")
+
+    run_reorganize_matching(
+        reorganize_session.id,
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    final = reorganize_repo.get(reorganize_session.id)
+    assert final.matching_status == "failed"
+    assert final.matched_count == 0
+
+    dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
+
+
+def test_run_reorganize_matching_marks_done_when_fetch_is_healthy_but_snapshot_already_processed(session):
+    """Regression guard: a run with a perfectly healthy fetch whose full
+    snapshot was already processed by a prior pass (so this run legitimately
+    has nothing new to match) must still end matching_status == "done", not
+    "failed"."""
+    from app.jobs.reorganize_matching import run_reorganize_matching
+
+    user = _make_user(session)
+    library_repo, playlist_repo, queue_repo, reorganize_repo = _repos(session)
+    dependency_health_store.set_status("youtube_detection", DependencyStatus.OK)
+    reorganize_session = reorganize_repo.create(
+        ReorganizeSession(user_id=user.id, video_id_snapshot=[], clustering_status="done")
+    )
+    classification_service = _classification_service({})
+    music_client = _music_client([])
+
+    run_reorganize_matching(
+        reorganize_session.id,
+        user.id,
+        engine=session.get_bind(),
+        music_client=music_client,
+        classification_service=classification_service,
+    )
+
+    final = reorganize_repo.get(reorganize_session.id)
+    assert final.matching_status == "done"
+    assert final.matched_count == 0
+    status, _ = dependency_health_store.get_status("youtube_detection")
+    assert status == DependencyStatus.OK
