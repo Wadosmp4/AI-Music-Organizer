@@ -3,11 +3,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { fetchAuthStatus, type AuthStatus, type StatusEntry } from "../api/client";
 import { STATUS_DOT_CLASSES, STATUS_LABELS } from "../styles";
 
-export type Page = "review" | "settings" | "onboarding";
+export type Page = "playlists" | "organize" | "settings";
 
 const NAV_ITEMS: { page: Page; label: string }[] = [
-  { page: "review", label: "Review Queue" },
-  { page: "onboarding", label: "Onboarding" },
+  { page: "playlists", label: "Playlists" },
+  { page: "organize", label: "Organize" },
   { page: "settings", label: "Settings" },
 ];
 
