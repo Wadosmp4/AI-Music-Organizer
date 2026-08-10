@@ -6,13 +6,13 @@ import { ReviewQueue } from "./pages/ReviewQueue";
 import { Settings } from "./pages/Settings";
 
 export function App() {
-  const [page, setPage] = useState<Page>("review");
+  const [page, setPage] = useState<Page>("organize");
 
   return (
     <Layout page={page} onPageChange={setPage}>
-      {page === "review" && <ReviewQueue />}
+      {page === "organize" && <ReviewQueue />}
       {page === "settings" && <Settings />}
-      {page === "onboarding" && <Onboarding onComplete={() => setPage("review")} />}
+      {page === "playlists" && <Onboarding onComplete={() => setPage("organize")} />}
     </Layout>
   );
 }

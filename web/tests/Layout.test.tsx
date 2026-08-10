@@ -21,30 +21,33 @@ beforeEach(() => {
 });
 
 describe("Layout", () => {
-  it("renders the app name, all three nav links, and the page content", async () => {
+  it("renders the app name, all three nav links in Playlists/Organize/Settings order, and the page content", async () => {
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
 
     render(
-      <Layout page="review" onPageChange={() => {}}>
+      <Layout page="organize" onPageChange={() => {}}>
         <div>page content</div>
       </Layout>,
     );
 
     expect(screen.getByText("Music Organizer")).toBeInTheDocument();
-    expect(screen.getByText("Review Queue")).toBeInTheDocument();
-    expect(screen.getByText("Onboarding")).toBeInTheDocument();
-    expect(screen.getByText("Settings")).toBeInTheDocument();
+    const navButtons = screen.getAllByRole("button");
+    expect(navButtons.map((button) => button.textContent)).toEqual([
+      "Playlists",
+      "Organize",
+      "Settings",
+    ]);
     expect(screen.getByText("page content")).toBeInTheDocument();
 
     await waitFor(() => expect(client.fetchAuthStatus).toHaveBeenCalled());
   });
 
-  it("calls onPageChange with the clicked page", async () => {
+  it("calls onPageChange with the clicked page and highlights the active nav item", async () => {
     vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
     const onPageChange = vi.fn();
 
     render(
-      <Layout page="review" onPageChange={onPageChange}>
+      <Layout page="organize" onPageChange={onPageChange}>
         <div>page content</div>
       </Layout>,
     );
@@ -53,6 +56,24 @@ describe("Layout", () => {
     await user.click(screen.getByText("Settings"));
 
     expect(onPageChange).toHaveBeenCalledWith("settings");
+    expect(screen.getByText("Organize").className).toContain("bg-accent");
+    expect(screen.getByText("Settings").className).not.toContain("bg-accent");
+  });
+
+  it("switches active highlighting to Playlists when clicked", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    const onPageChange = vi.fn();
+
+    render(
+      <Layout page="organize" onPageChange={onPageChange}>
+        <div>page content</div>
+      </Layout>,
+    );
+
+    const user = userEvent.setup();
+    await user.click(screen.getByText("Playlists"));
+
+    expect(onPageChange).toHaveBeenCalledWith("playlists");
   });
 
   it("shows a status dot per health state, including degraded", async () => {
@@ -63,7 +84,7 @@ describe("Layout", () => {
     });
 
     render(
-      <Layout page="review" onPageChange={() => {}}>
+      <Layout page="organize" onPageChange={() => {}}>
         <div>page content</div>
       </Layout>,
     );
