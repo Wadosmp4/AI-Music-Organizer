@@ -873,7 +873,13 @@ describe("Onboarding", () => {
     await screen.findByText(/won't be written to YouTube until/);
   });
 
-  it("shows the done confirmation without switching away in the same tick", async () => {
+  // R5/KD4 (session-settled, user-directed): auto-navigate to Organize
+  // immediately after confirming selection, with no extra click and no
+  // intermediate "done" pause -- Organize's own extended progress block
+  // (U5) already carries the "Classifying…" state. Supersedes the prior
+  // behavior (deferring onComplete by 1500ms so a local "done" message
+  // could paint first).
+  it("calls onComplete immediately after finishing setup, without an artificial delay (R5/KD4)", async () => {
     vi.mocked(client.fetchOnboardingPlaylists).mockResolvedValue({
       existing_playlists: [],
       added_playlists: [],
@@ -894,16 +900,14 @@ describe("Onboarding", () => {
     await screen.findByText("No new-playlist suggestions found.");
 
     const user = userEvent.setup();
+    const start = Date.now();
     await user.click(screen.getByText("Finish setup"));
 
-    await screen.findByRole("status");
-    expect(screen.getByRole("status")).toHaveTextContent(
-      "Playlists created — the backlog will now be organized for review.",
-    );
-    // onComplete is deferred, not called synchronously with setDone(true) --
-    // calling it in the same tick would let the parent switch pages before
-    // this "done" message ever gets a chance to paint.
-    expect(onComplete).not.toHaveBeenCalled();
+    // The old implementation only called onComplete after a 1500ms
+    // setTimeout -- a generous 500ms ceiling (well under that) is enough to
+    // tell the two apart without being flaky on a slow CI box.
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledTimes(1));
+    expect(Date.now() - start).toBeLessThan(500);
   });
 
   it("ignores a second click on Finish setup while the first is still submitting", async () => {

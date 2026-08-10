@@ -418,12 +418,15 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
 
     if (!mountedRef.current) return;
     setDone(true);
-    // Calling onComplete() synchronously here batches with setDone(true) into
-    // one React update, so App.tsx switches pages before the "done" message
-    // below ever paints -- give it a moment on screen first. Matching itself
-    // now runs entirely server-side (U4 follow-up), so this no longer waits
-    // on it -- the Review Queue page picks up its live progress instead.
-    setTimeout(() => onComplete?.(), 1500);
+    // R5/KD4: navigate to Organize immediately -- no extra click, no
+    // intermediate pause. Organize's own extended progress block (U5)
+    // already carries the "Classifying…" state, so nothing here needs to
+    // stay on screen first (when there's no onComplete callback -- e.g. this
+    // component rendered standalone -- setDone(true) above still shows the
+    // confirmation message). Matching itself runs entirely server-side (U4
+    // follow-up), so this doesn't wait on it either -- the Review Queue page
+    // picks up its live progress independently.
+    onComplete?.();
   }
 
   // Every added playlist keeps the section it originated from (checked)
