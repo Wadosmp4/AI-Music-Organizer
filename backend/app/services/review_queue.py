@@ -11,7 +11,7 @@ import logging
 from typing import Optional
 
 from app.integrations.auth_status import AuthStatus, auth_status_store
-from app.integrations.base import MusicServiceClient, track_from_library_item
+from app.integrations.base import MusicServiceClient, QuotaExceededError, track_from_library_item
 from app.models.correction_log import CorrectionLogEntry
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.correction_log_repository import CorrectionLogRepository
@@ -129,6 +129,13 @@ class ReviewQueueService:
 
         try:
             self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
+        except QuotaExceededError:
+            # Not a credential problem -- reconnecting OAuth won't free up
+            # quota, so don't mislabel this as NEEDS_RECONNECT (KTD17). The
+            # item still reverts to pending either way, since it genuinely
+            # wasn't written.
+            self._complete_pending_write(pending_item, "pending", write_succeeded=False)
+            raise
         except Exception as exc:
             auth_status_store.set_write_status(
                 AuthStatus.NEEDS_RECONNECT, f"approve write failed: {exc}"
@@ -167,6 +174,12 @@ class ReviewQueueService:
 
             try:
                 self.music_client.add_playlist_items(youtube_playlist_id, [library_item.video_id])
+            except QuotaExceededError:
+                # See approve()'s matching branch -- not an auth problem.
+                self._complete_pending_write(
+                    pending_item, "pending", write_succeeded=False, playlist_id=old_playlist_id
+                )
+                raise
             except Exception as exc:
                 auth_status_store.set_write_status(
                     AuthStatus.NEEDS_RECONNECT, f"move write failed: {exc}"

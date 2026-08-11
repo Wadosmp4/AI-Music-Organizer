@@ -24,6 +24,18 @@ class PlaylistSummary(TypedDict):
     title: str
 
 
+class QuotaExceededError(Exception):
+    """A `MusicServiceClient` call failed because the underlying service's
+    API quota is exhausted for the current window (e.g. YouTube Data API
+    v3's daily cap) -- distinct from an auth/credential failure (retrying
+    or reconnecting won't fix it, only waiting for the quota to reset
+    will) and distinct from a generic/transient failure (retrying
+    immediately is actively counterproductive, since each retry burns more
+    of the same exhausted quota). Callers surface this specifically rather
+    than folding it into a generic "connection needs attention" message.
+    """
+
+
 class MusicServiceClient(ABC):
     """Data-source-agnostic boundary (R1, KTD25).
 

@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api.v1 import router as api_v1_router
+from app.integrations.base import QuotaExceededError
 from app.repositories.review_queue_repository import VersionConflictError
 from app.services.review_queue import ItemNotFoundError, StaleItemError
 
@@ -50,3 +51,14 @@ def _stale_item_handler(request: Request, exc: StaleItemError) -> JSONResponse:
 @app.exception_handler(VersionConflictError)
 def _version_conflict_handler(request: Request, exc: VersionConflictError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(QuotaExceededError)
+def _quota_exceeded_handler(request: Request, exc: QuotaExceededError) -> JSONResponse:
+    # 503 (service temporarily unavailable), not 500 -- this is an external
+    # dependency's own rate limit, not a bug, and it self-resolves once the
+    # quota window rolls over. A structured `reason` lets the frontend show
+    # a specific message instead of a generic error.
+    return JSONResponse(
+        status_code=503, content={"reason": "quota_exceeded", "message": str(exc)}
+    )

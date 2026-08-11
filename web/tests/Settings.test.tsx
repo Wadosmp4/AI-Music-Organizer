@@ -82,6 +82,49 @@ describe("Settings", () => {
     expect(client.fetchAuthStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("shows a degraded-not-reconnect banner when youtube_detection is degraded", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue({
+      ...baseAuthStatus,
+      youtube_detection: {
+        status: "degraded",
+        reason: "YouTube API daily quota exceeded. This resets at midnight Pacific Time.",
+      },
+    });
+
+    render(<Settings />);
+
+    await screen.findByText(/YouTube library reads are temporarily degraded/);
+    expect(
+      screen.getByText(/YouTube API daily quota exceeded\. This resets at midnight Pacific Time\./),
+    ).toBeInTheDocument();
+    // Distinct from the reconnect banners -- no reconnect call to action.
+    expect(screen.queryByText(/needs reconnecting/)).not.toBeInTheDocument();
+  });
+
+  it("shows the error message when creating a playlist fails", async () => {
+    vi.mocked(client.fetchAuthStatus).mockResolvedValue(baseAuthStatus);
+    vi.mocked(client.createPlaylist).mockRejectedValue(
+      new Error(
+        "YouTube API daily quota exceeded. This resets at midnight Pacific Time -- try again after it resets.",
+      ),
+    );
+
+    render(<Settings />);
+    await screen.findByText("Write path (playlist edits)");
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Name"), "Road Trip");
+    await user.type(screen.getByLabelText("Description"), "songs for driving");
+    await user.click(screen.getByText("Create"));
+
+    // Previously unhandled -- the form gave no feedback at all on failure.
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "YouTube API daily quota exceeded. This resets at midnight Pacific Time -- try again after it resets.",
+      );
+    });
+  });
+
   it("does not update state after unmount", async () => {
     let resolveFetch: (status: client.AuthStatus) => void = () => {};
     vi.mocked(client.fetchAuthStatus).mockReturnValue(

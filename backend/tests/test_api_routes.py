@@ -16,7 +16,7 @@ from qdrant_client import QdrantClient
 
 from app.api.deps import get_music_client, get_session, get_vector_repository_dep
 from app.integrations.auth_status import AuthStatus, auth_status_store
-from app.integrations.base import MusicServiceClient
+from app.integrations.base import MusicServiceClient, QuotaExceededError
 from app.main import app
 from app.models.library import LibraryItem
 from app.models.playlist import Playlist
@@ -208,6 +208,35 @@ def test_approve_via_http_generic_write_failure_maps_to_502(
     )
 
     assert response.status_code == 502
+
+
+def test_approve_via_http_quota_exceeded_maps_to_503_and_does_not_flip_auth_status(
+    session, api_client, fake_music_client
+):
+    """Distinct from the generic-failure case above: a quota error isn't a
+    credential problem, so it must not be folded into the same 502/
+    NEEDS_RECONNECT path a real write failure gets (see _DOMAIN_EXCEPTIONS
+    in app/api/v1/review_queue.py and the QuotaExceededError handler in
+    app/main.py)."""
+    user = _seed_default_user(session)
+    _, _, queue_item = _seed_review_queue_item(session, user)
+    fake_music_client.add_playlist_items.side_effect = QuotaExceededError(
+        "YouTube API daily quota exceeded."
+    )
+
+    response = api_client.post(
+        f"/api/v1/review-queue/{queue_item.id}/approve",
+        json={"expected_version": 1},
+        headers=_CSRF_HEADERS,
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "reason": "quota_exceeded",
+        "message": "YouTube API daily quota exceeded.",
+    }
+    status, _ = auth_status_store.get_write_status()
+    assert status == AuthStatus.OK
 
 
 def test_move_via_http_stale_item_maps_to_409(session, api_client):

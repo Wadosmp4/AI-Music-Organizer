@@ -49,6 +49,7 @@ def call_with_retry(
     retries: int = 3,
     delay_s: float = 1.0,
     retry_on: tuple[type[Exception], ...] = (Exception,),
+    non_retryable: tuple[type[Exception], ...] = (),
     circuit_breaker: CircuitBreaker | None = None,
 ) -> T:
     """Retries `fn` on exceptions matching `retry_on`, honoring an optional circuit breaker.
@@ -56,6 +57,15 @@ def call_with_retry(
     `retry_on` should name specific transient exception types for each
     integration (network errors, rate-limit responses) rather than the
     legacy script's blind retry-on-any-exception.
+
+    `non_retryable` is an escape hatch for a caller-translated exception
+    that would otherwise match `retry_on` (e.g. `retry_on=(Exception,)`
+    matches everything) but is known in advance to never succeed on retry
+    -- a quota-exceeded error is the motivating case: retrying it three
+    times with a real network call each time just burns more of the same
+    already-exhausted quota for no benefit. Checked before `retry_on` and
+    skips circuit-breaker bookkeeping too, since this isn't evidence the
+    dependency itself is unhealthy.
     """
     if circuit_breaker is not None:
         circuit_breaker.before_call()
@@ -64,6 +74,8 @@ def call_with_retry(
     for attempt in range(1, retries + 1):
         try:
             result = fn()
+        except non_retryable:
+            raise
         except retry_on as exc:
             last_exc = exc
             if circuit_breaker is not None:

@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # not the primary datastore (that's database_url/SQLite).
     qdrant_url: str = "http://localhost:6333"
 
+    # TEST-ONLY: caps get_liked_songs() to the first N tracks so local
+    # end-to-end testing can simulate a small library (e.g. 200 songs)
+    # without touching the real YouTube account. 0 (default) disables the
+    # cap entirely -- unset in normal/production use.
+    liked_songs_test_limit: int = 0
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -65,12 +65,19 @@ export function Settings() {
 
   async function handleCreatePlaylist(event: React.FormEvent) {
     event.preventDefault();
-    const result = await createPlaylist(name, description);
-    setMessage(
-      `Created "${result.playlist.name}" — ${result.review_queue_items_created} songs proposed for review.`,
-    );
-    setName("");
-    setDescription("");
+    try {
+      const result = await createPlaylist(name, description);
+      setMessage(
+        `Created "${result.playlist.name}" — ${result.review_queue_items_created} songs proposed for review.`,
+      );
+      setName("");
+      setDescription("");
+    } catch (err) {
+      // Previously unhandled -- a quota-exceeded 503 (or any other failure)
+      // during playlist creation left the form appearing to hang forever
+      // with no feedback at all.
+      setMessage(err instanceof Error ? err.message : String(err));
+    }
   }
 
   return (

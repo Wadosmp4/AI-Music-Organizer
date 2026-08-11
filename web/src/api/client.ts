@@ -119,6 +119,22 @@ export class ApiError extends Error {
   }
 }
 
+// Every backend error handler (main.py) sends either a plain-string
+// `detail` (bare HTTPException) or a `message` field (e.g. the
+// quota_exceeded handler) -- prefer that human-readable text over the raw
+// "Request to X failed (503): {...}" fallback, which is what every existing
+// `catch (err) { setError(err.message) }` call site across the app renders
+// verbatim. A structured non-string `detail` (e.g. removal_requires_confirmation)
+// falls through to the fallback unchanged -- callers that need it read
+// `ApiError.body` directly, same as before.
+function friendlyErrorMessage(body: unknown, fallback: string): string {
+  if (typeof body !== "object" || body === null) return fallback;
+  const { message, detail } = body as Record<string, unknown>;
+  if (typeof message === "string") return message;
+  if (typeof detail === "string") return detail;
+  return fallback;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     // X-Requested-With: the backend's CSRF guard (app/main.py) requires this
@@ -136,7 +152,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Not a JSON body -- ApiError.body stays null, message keeps the raw text.
     }
-    throw new ApiError(response.status, body, `Request to ${path} failed (${response.status}): ${text}`);
+    const fallback = `Request to ${path} failed (${response.status}): ${text}`;
+    throw new ApiError(response.status, body, friendlyErrorMessage(body, fallback));
   }
   return response.json() as Promise<T>;
 }

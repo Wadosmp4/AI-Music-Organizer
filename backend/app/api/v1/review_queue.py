@@ -9,6 +9,7 @@ from app.api.deps import (
     get_playlist_repository,
     get_review_queue_service,
 )
+from app.integrations.base import QuotaExceededError
 from app.models.review_queue import ReviewQueueItem
 from app.repositories.library_repository import LibraryRepository
 from app.repositories.playlist_repository import PlaylistRepository
@@ -18,7 +19,7 @@ from app.services.review_queue import ItemNotFoundError, ReviewQueueService, Sta
 # Raised by the service layer and mapped to their HTTP status uniformly by
 # the handlers registered in main.py — must propagate past this route's own
 # generic except-Exception below, not be swallowed into a 502.
-_DOMAIN_EXCEPTIONS = (ItemNotFoundError, StaleItemError, VersionConflictError)
+_DOMAIN_EXCEPTIONS = (ItemNotFoundError, StaleItemError, VersionConflictError, QuotaExceededError)
 
 router = APIRouter(prefix="/review-queue", tags=["review-queue"])
 

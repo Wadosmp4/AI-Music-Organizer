@@ -1,8 +1,11 @@
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from app.integrations.auth_status import AuthStatus, auth_status_store
+from app.integrations.base import QuotaExceededError
 from app.integrations.http_client import CircuitBreaker
 from app.integrations.youtube_data_api_client import YouTubeDataApiClient, artist_bucket_key
 
@@ -22,6 +25,33 @@ def _client_with_valid_creds(tmp_path) -> YouTubeDataApiClient:
     client = YouTubeDataApiClient(token_file=str(token_file))
     client._load_credentials = MagicMock(return_value=MagicMock())
     return client
+
+
+class _FakeResp:
+    def __init__(self, status: int):
+        self.status = status
+        self.reason = "Forbidden"
+
+
+def _quota_exceeded_http_error() -> HttpError:
+    """Shaped like a real YouTube Data API v3 403 quotaExceeded response --
+    `error.errors[0].reason` is what googleapiclient's HttpError parses into
+    `error_details`, which _is_quota_exceeded reads."""
+    content = json.dumps(
+        {
+            "error": {
+                "message": "The request cannot be completed because you have exceeded your quota.",
+                "errors": [
+                    {
+                        "message": "The request cannot be completed because you have exceeded your quota.",
+                        "domain": "youtube.quota",
+                        "reason": "quotaExceeded",
+                    }
+                ],
+            }
+        }
+    ).encode("utf-8")
+    return HttpError(_FakeResp(403), content, uri="https://youtube.googleapis.com/youtube/v3/playlists")
 
 
 def test_create_playlist_calls_data_api_and_returns_id(tmp_path):
@@ -60,6 +90,46 @@ def test_create_playlist_failure_flips_write_path_to_needs_reconnect(tmp_path):
     status, reason = auth_status_store.get_write_status()
     assert status == AuthStatus.NEEDS_RECONNECT
     assert "quota exceeded" in reason
+
+
+def test_create_playlist_quota_exceeded_raises_quota_error_without_retry_or_reconnect(tmp_path):
+    """Contrast with the generic-failure test above: a real 403 quotaExceeded
+    must not be retried (each retry burns more of the same exhausted quota
+    for nothing) and must not flip write_path to NEEDS_RECONNECT (reconnecting
+    OAuth doesn't free up quota)."""
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.playlists.return_value.insert.return_value.execute.side_effect = (
+            _quota_exceeded_http_error()
+        )
+        mock_build.return_value = mock_youtube
+
+        with pytest.raises(QuotaExceededError):
+            client.create_playlist("Road Trip", "")
+
+    assert mock_youtube.playlists.return_value.insert.return_value.execute.call_count == 1
+    status, _ = auth_status_store.get_write_status()
+    assert status == AuthStatus.OK
+
+
+def test_get_liked_songs_quota_exceeded_raises_quota_error_without_retry_or_reconnect(tmp_path):
+    client = _client_with_valid_creds(tmp_path)
+
+    with patch("app.integrations.youtube_data_api_client.build") as mock_build:
+        mock_youtube = MagicMock()
+        mock_youtube.channels.return_value.list.return_value.execute.side_effect = (
+            _quota_exceeded_http_error()
+        )
+        mock_build.return_value = mock_youtube
+
+        with pytest.raises(QuotaExceededError):
+            client.get_liked_songs()
+
+    assert mock_youtube.channels.return_value.list.return_value.execute.call_count == 1
+    status, _ = auth_status_store.get_detection_status()
+    assert status == AuthStatus.OK
 
 
 def test_add_playlist_items_inserts_each_video(tmp_path):

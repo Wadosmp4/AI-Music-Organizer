@@ -19,7 +19,8 @@ export function ConnectionHealthBanners({ authStatus }: { authStatus: AuthStatus
 
   const hasBanner =
     authStatus.write_path.status === "needs_reconnect" ||
-    authStatus.detection_path.status === "needs_reconnect";
+    authStatus.detection_path.status === "needs_reconnect" ||
+    authStatus.youtube_detection.status === "degraded";
   if (!hasBanner) return null;
 
   return (
@@ -36,6 +37,17 @@ export function ConnectionHealthBanners({ authStatus }: { authStatus: AuthStatus
           New-like detection needs reconnecting
           {authStatus.detection_path.reason ? `: ${authStatus.detection_path.reason}` : ""}.
           Reconnect your Google account to resume detecting new likes.
+        </Banner>
+      )}
+      {/* Distinct from the two reconnect banners above: a degraded
+          youtube_detection reading (e.g. a quota-exceeded 403) isn't a
+          credential problem, so it gets its own banner with no reconnect
+          call to action -- the reason text (backend-supplied) already says
+          what's actually wrong and when it self-resolves. */}
+      {authStatus.youtube_detection.status === "degraded" && (
+        <Banner testId="youtube-detection-degraded-banner">
+          YouTube library reads are temporarily degraded
+          {authStatus.youtube_detection.reason ? `: ${authStatus.youtube_detection.reason}` : ""}.
         </Banner>
       )}
     </div>
